@@ -1,0 +1,12 @@
+[package]
+name = "salvage-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "salvage"
+path = "src/main.rs"
+
+[dependencies]
+salvage-core = { path = "../salvage-core" }

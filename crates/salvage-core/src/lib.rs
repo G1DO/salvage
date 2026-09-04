@@ -1,0 +1,22 @@
+//! Core domain and lifecycle entry points.
+
+use salvage_evidence::CheckResult;
+use salvage_postgres::Adapter;
+
+/// Runs the non-invasive workspace bootstrap check.
+pub fn workspace_check() -> CheckResult {
+    CheckResult::workspace(Adapter::new().name())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workspace_check;
+
+    #[test]
+    fn reports_the_bootstrap_boundaries() {
+        assert_eq!(
+            workspace_check().to_json(),
+            r#"{"status":"ok","component":"workspace","postgres_adapter":"postgres"}"#
+        );
+    }
+}

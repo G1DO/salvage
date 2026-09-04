@@ -1,0 +1,9 @@
+[package]
+name = "salvage-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+salvage-evidence = { path = "../salvage-evidence" }
+salvage-postgres = { path = "../salvage-postgres" }
