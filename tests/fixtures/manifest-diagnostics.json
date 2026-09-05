@@ -1,0 +1,17 @@
+{
+  "manifest-valid-v1.json": "ok",
+  "manifest-invalid-v1-malformed.json": "manifest/parse",
+  "manifest-invalid-v1-unknown-field.json": "manifest/schema",
+  "manifest-invalid-v1-unknown-source.json": "manifest/schema",
+  "manifest-invalid-v1-null-target.json": "manifest/schema",
+  "manifest-invalid-v1-unsupported-version.json": "manifest/unsupported-version",
+  "manifest-invalid-v2-divergent.json": "manifest/unsupported-version",
+  "manifest-invalid-v1-bad-digest.json": "manifest/semantic/backup-digest",
+  "manifest-invalid-v1-bad-postgres-version.json": "manifest/semantic/postgres-version",
+  "manifest-invalid-v1-zero-limits.json": "manifest/semantic/limits",
+  "manifest-invalid-v1-zero-deadlines.json": "manifest/semantic/deadlines",
+  "manifest-invalid-v1-blank-destination.json": "manifest/semantic/evidence-destination",
+  "manifest-invalid-v1-blank-owner.json": "manifest/semantic/run-owner",
+  "manifest-invalid-v1-pitr-without-target.json": "manifest/semantic/restore-combination",
+  "manifest-invalid-v1-bad-base-digest.json": "manifest/semantic/base-backup-digest"
+}
