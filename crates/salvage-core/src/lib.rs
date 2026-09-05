@@ -1,5 +1,7 @@
 //! Core domain and lifecycle entry points.
 
+pub mod manifest;
+
 use salvage_evidence::CheckResult;
 use salvage_postgres::Adapter;
 
