@@ -305,3 +305,217 @@ where
 
     deserializer.deserialize_option(NoNull)
 }
+fn is_hex_digest(text: &str) -> bool {
+    text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn validate_digest(field: &str, code: &'static str, value: &str) -> Result<(), ManifestError> {
+    match value.strip_prefix("sha256:") {
+        Some(hex) if is_hex_digest(hex) => Ok(()),
+        _ => Err(semantic(
+            code,
+            format!("{field} must be `sha256:<64 hex>`, got {value:?}"),
+        )),
+    }
+}
+
+fn validate_postgres_version(value: &str) -> Result<(), ManifestError> {
+    let parts: Vec<&str> = value.split('.').collect();
+    let numeric = (parts.len() == 2 || parts.len() == 3)
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()));
+    if numeric {
+        Ok(())
+    } else {
+        Err(semantic(
+            "manifest/semantic/postgres-version",
+            format!(
+                "postgres.version must be MAJOR.MINOR[.PATCH] with numeric parts, got {value:?}"
+            ),
+        ))
+    }
+}
+
+fn validate_manifest(manifest: &mut Manifest) -> Result<(), ManifestError> {
+    // Normalize the effective manifest: surrounding whitespace in free-text
+    // value fields is never significant (padding variants must share one
+    // canonical form and one hash). `schema_version` is the version-dispatch
+    // key and must match exactly, so it is not trimmed.
+    manifest.backup.digest = manifest.backup.digest.trim().to_owned();
+    manifest.postgres.version = manifest.postgres.version.trim().to_owned();
+    if let Some(target) = manifest.restore.recovery_target.take() {
+        manifest.restore.recovery_target = Some(target.trim().to_owned());
+    }
+    if let Some(digest) = manifest.restore.base_backup_digest.take() {
+        manifest.restore.base_backup_digest = Some(digest.trim().to_owned());
+    }
+    manifest.evidence.destination = manifest.evidence.destination.trim().to_owned();
+    manifest.run.owner = manifest.run.owner.trim().to_owned();
+
+    validate_digest(
+        "backup.digest",
+        "manifest/semantic/backup-digest",
+        &manifest.backup.digest,
+    )?;
+    validate_postgres_version(&manifest.postgres.version)?;
+
+    match manifest.restore.restore_type {
+        RestoreType::Full => {
+            if manifest.restore.recovery_target.is_some() {
+                return Err(semantic(
+                    "manifest/semantic/restore-combination",
+                    "restore.recovery_target is only allowed with type `pitr`",
+                ));
+            }
+            if manifest.restore.base_backup_digest.is_some() {
+                return Err(semantic(
+                    "manifest/semantic/restore-combination",
+                    "restore.base_backup_digest is only allowed with type `incremental`",
+                ));
+            }
+        }
+        RestoreType::Pitr => {
+            match &manifest.restore.recovery_target {
+                Some(target) if !target.is_empty() => {}
+                _ => {
+                    return Err(semantic(
+                        "manifest/semantic/restore-combination",
+                        "restore.recovery_target is required and must be non-blank with type `pitr`",
+                    ));
+                }
+            }
+            if manifest.restore.base_backup_digest.is_some() {
+                return Err(semantic(
+                    "manifest/semantic/restore-combination",
+                    "restore.base_backup_digest is only allowed with type `incremental`",
+                ));
+            }
+        }
+        RestoreType::Incremental => {
+            match &manifest.restore.base_backup_digest {
+                Some(digest) => validate_digest(
+                    "restore.base_backup_digest",
+                    "manifest/semantic/base-backup-digest",
+                    digest,
+                )?,
+                None => {
+                    return Err(semantic(
+                        "manifest/semantic/restore-combination",
+                        "restore.base_backup_digest is required with type `incremental`",
+                    ));
+                }
+            }
+            if manifest.restore.recovery_target.is_some() {
+                return Err(semantic(
+                    "manifest/semantic/restore-combination",
+                    "restore.recovery_target is only allowed with type `pitr`",
+                ));
+            }
+        }
+    }
+
+    if manifest.limits.cpu_millicores <= 0
+        || manifest.limits.memory_mib <= 0
+        || manifest.limits.disk_mib <= 0
+    {
+        return Err(semantic(
+            "manifest/semantic/limits",
+            "limits.cpu_millicores, limits.memory_mib, and limits.disk_mib must all be positive",
+        ));
+    }
+
+    if manifest.deadlines.restore_seconds <= 0 || manifest.deadlines.verify_seconds <= 0 {
+        return Err(semantic(
+            "manifest/semantic/deadlines",
+            "deadlines.restore_seconds and deadlines.verify_seconds must both be positive",
+        ));
+    }
+
+    if manifest.evidence.destination.is_empty() {
+        return Err(semantic(
+            "manifest/semantic/evidence-destination",
+            "evidence.destination must be non-blank",
+        ));
+    }
+
+    if manifest.run.owner.is_empty() {
+        return Err(semantic(
+            "manifest/semantic/run-owner",
+            "run.owner must be non-blank",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Parses and validates a manifest document.
+///
+/// Stage order is fixed: JSON parsing, then the `schema_version` gate, then
+/// shape (schema) checks, then normalization plus semantic validation. Each
+/// stage has its own diagnostic code family so callers can distinguish the
+/// failure kind. Version dispatch happens before shape checks so a document
+/// declaring an unimplemented version always reports
+/// `manifest/unsupported-version`, even if its fields also differ from the
+/// supported schema.
+///
+/// Surrounding whitespace in free-text value fields is trimmed during
+/// validation, so padding variants share one canonical form and one hash.
+pub fn parse_manifest(text: &str) -> Result<Manifest, ManifestError> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|error| ManifestError::Parse {
+            message: format!("invalid JSON: {error}"),
+        })?;
+    parse_manifest_value(value)
+}
+
+/// Parses and validates a manifest from raw bytes.
+///
+/// Manifests are UTF-8 JSON: undecodable bytes report `manifest/parse`
+/// (malformed input), not an I/O error. Decodable input follows the same
+/// stages as [`parse_manifest`].
+pub fn parse_manifest_bytes(bytes: &[u8]) -> Result<Manifest, ManifestError> {
+    let text = std::str::from_utf8(bytes).map_err(|error| ManifestError::Parse {
+        message: format!("invalid UTF-8: {error}"),
+    })?;
+    parse_manifest(text)
+}
+
+fn parse_manifest_value(value: serde_json::Value) -> Result<Manifest, ManifestError> {
+    let version = match value.get("schema_version") {
+        Some(serde_json::Value::String(version)) => version.clone(),
+        _ => {
+            return Err(ManifestError::Schema {
+                message: "schema violation: missing or non-string `schema_version`".to_owned(),
+            });
+        }
+    };
+    if version != SUPPORTED_SCHEMA_VERSION {
+        return Err(ManifestError::UnsupportedVersion { found: version });
+    }
+    let mut manifest: Manifest =
+        serde_json::from_value(value).map_err(|error| ManifestError::Schema {
+            message: format!("schema violation: {error}"),
+        })?;
+    validate_manifest(&mut manifest)?;
+    Ok(manifest)
+}
+
+/// Serializes the manifest in canonical form (compact JSON, declaration
+/// field order, no trailing newline).
+pub fn normalized_json(manifest: &Manifest) -> String {
+    serde_json::to_string(manifest).expect("manifest serialization is infallible")
+}
+
+/// Returns the canonical content hash identifying the exact effective
+/// manifest: `sha256:<hex>` over [`normalized_json`] bytes.
+pub fn manifest_hash(manifest: &Manifest) -> String {
+    let digest = Sha256::digest(normalized_json(manifest).as_bytes());
+    let mut hex = String::with_capacity(HASH_PREFIX.len() + 64);
+    hex.push_str(HASH_PREFIX);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
