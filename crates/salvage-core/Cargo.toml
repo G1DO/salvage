@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+libc = "0.2"
 salvage-evidence = { path = "../salvage-evidence" }
 salvage-postgres = { path = "../salvage-postgres" }
 serde = { version = "1", features = ["derive"] }
@@ -13,3 +14,4 @@ sha2 = "0.10"
 
 [dev-dependencies]
 serde_json = "1"
+

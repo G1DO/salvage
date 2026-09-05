@@ -103,6 +103,7 @@ dependencies = [
 name = "salvage-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "salvage-evidence",
  "salvage-postgres",
  "serde",
