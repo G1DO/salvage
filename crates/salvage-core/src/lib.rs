@@ -1,5 +1,6 @@
 //! Core domain and lifecycle entry points.
 
+pub mod lifecycle;
 pub mod manifest;
 
 use salvage_evidence::CheckResult;
