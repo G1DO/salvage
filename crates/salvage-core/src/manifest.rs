@@ -519,3 +519,144 @@ pub fn manifest_hash(manifest: &Manifest) -> String {
     hex
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{
+        ManifestError, manifest_hash, normalized_json, parse_manifest, parse_manifest_bytes,
+    };
+
+    const VALID: &str = r#"{
+        "schema_version": "v1",
+        "backup": {"digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+        "postgres": {"version": "16.4"},
+        "restore": {"source": "s3", "type": "full"},
+        "limits": {"cpu_millicores": 500, "memory_mib": 1024, "disk_mib": 5120},
+        "deadlines": {"restore_seconds": 600, "verify_seconds": 300},
+        "evidence": {"destination": "file:///tmp/salvage-evidence"},
+        "run": {"owner": "recovery-drill"}
+    }"#;
+
+    #[test]
+    fn accepts_a_valid_manifest() {
+        let manifest = parse_manifest(VALID).expect("valid manifest must parse");
+        assert_eq!(manifest.schema_version, "v1");
+        assert!(manifest_hash(&manifest).starts_with("sha256:"));
+    }
+
+    #[test]
+    fn canonical_form_is_stable_and_ordered() {
+        let pretty = VALID;
+        let reordered = r#"{"run": {"owner": "recovery-drill"}, "evidence": {"destination": "file:///tmp/salvage-evidence"}, "deadlines": {"verify_seconds": 300, "restore_seconds": 600}, "limits": {"disk_mib": 5120, "memory_mib": 1024, "cpu_millicores": 500}, "restore": {"type": "full", "source": "s3"}, "postgres": {"version": "16.4"}, "backup": {"digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}, "schema_version": "v1"}"#;
+        let first = parse_manifest(pretty).expect("valid");
+        let second = parse_manifest(reordered).expect("valid");
+        assert_eq!(normalized_json(&first), normalized_json(&second));
+        assert_eq!(manifest_hash(&first), manifest_hash(&second));
+        assert!(
+            normalized_json(&first).starts_with(r#"{"schema_version":"v1","backup":"#),
+            "canonical form must keep declaration order"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_fields() {
+        let text = VALID.replace(
+            r#""run": {"owner": "recovery-drill"}"#,
+            r#""run": {"owner": "recovery-drill"}, "scripts": ["echo hi"]"#,
+        );
+        assert_eq!(
+            parse_manifest(&text).expect_err("unknown field").code(),
+            "manifest/schema"
+        );
+    }
+
+    #[test]
+    fn distinguishes_error_kinds() {
+        assert_eq!(
+            parse_manifest("{oops").expect_err("parse").code(),
+            "manifest/parse"
+        );
+        assert_eq!(
+            parse_manifest(r#"{"schema_version": "v1"}"#)
+                .expect_err("schema")
+                .code(),
+            "manifest/schema"
+        );
+        assert_eq!(
+            parse_manifest(&VALID.replace(r#""v1""#, r#""v2""#))
+                .expect_err("version")
+                .code(),
+            "manifest/unsupported-version"
+        );
+        // A divergent future version reports unsupported-version even though
+        // its shape also differs from v1.
+        assert_eq!(
+            parse_manifest(r#"{"schema_version": "v2", "future_field": 1}"#)
+                .expect_err("divergent version")
+                .code(),
+            "manifest/unsupported-version"
+        );
+        let zero_limits = VALID.replace(r#""cpu_millicores": 500"#, r#""cpu_millicores": 0"#);
+        let error = parse_manifest(&zero_limits).expect_err("semantic");
+        assert!(matches!(error, ManifestError::Semantic { .. }));
+        assert_eq!(error.code(), "manifest/semantic/limits");
+    }
+
+    #[test]
+    fn padding_whitespace_shares_one_canonical_hash() {
+        let padded = VALID
+            .replace(
+                r#""owner": "recovery-drill""#,
+                r#""owner": "  recovery-drill  ""#,
+            )
+            .replace(
+                r#""destination": "file:///tmp/salvage-evidence""#,
+                r#""destination": "  file:///tmp/salvage-evidence  ""#,
+            );
+        let base = parse_manifest(VALID).expect("valid");
+        let normalized = parse_manifest(&padded).expect("padded");
+        assert_eq!(normalized.run.owner, "recovery-drill");
+        assert_eq!(
+            normalized.evidence.destination,
+            "file:///tmp/salvage-evidence"
+        );
+        assert_eq!(normalized_json(&base), normalized_json(&normalized));
+        assert_eq!(manifest_hash(&base), manifest_hash(&normalized));
+    }
+
+    #[test]
+    fn non_utf8_bytes_report_parse_not_schema() {
+        let bytes = b"\xff\xfe{\"schema_version\": \"v1\"}";
+        assert_eq!(
+            parse_manifest_bytes(bytes).expect_err("non-UTF-8").code(),
+            "manifest/parse"
+        );
+    }
+
+    #[test]
+    fn rejects_explicit_null_for_optional_fields() {
+        let text = VALID.replace(
+            r#""restore": {"source": "s3", "type": "full"}"#,
+            r#""restore": {"source": "s3", "type": "full", "recovery_target": null}"#,
+        );
+        assert_eq!(
+            parse_manifest(&text).expect_err("null target").code(),
+            "manifest/schema"
+        );
+    }
+
+    #[test]
+    fn requires_pitr_target_and_incremental_base() {
+        let pitr = VALID.replace(r#""type": "full""#, r#""type": "pitr""#);
+        assert_eq!(
+            parse_manifest(&pitr).expect_err("pitr target").code(),
+            "manifest/semantic/restore-combination"
+        );
+        let incremental = VALID.replace(r#""type": "full""#, r#""type": "incremental""#);
+        assert_eq!(
+            parse_manifest(&incremental)
+                .expect_err("incremental base")
+                .code(),
+            "manifest/semantic/restore-combination"
+        );
+    }
+}
