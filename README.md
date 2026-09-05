@@ -23,6 +23,8 @@ The bootstrap CLI is intentionally non-invasive. `salvage check` emits one JSON 
 
 `salvage manifest check <path>` validates a versioned (`v1`) recovery-run manifest without performing a restore: exit `0` prints the canonical `manifest_hash` (`sha256:<hex>` over the normalized manifest), exit `1` emits a typed `manifest/...` diagnostic, and exit `2` reports unreadable input or usage. Surrounding whitespace in value fields is trimmed before hashing, so padding variants share one hash; non-UTF-8 bytes report `manifest/parse` (exit `1`), while a missing file reports `io` (exit `2`). Golden valid/invalid fixtures live in `tests/fixtures/manifest-*.json` with expected codes in `tests/fixtures/manifest-diagnostics.json`. Manifest schema, compatibility, and hashing rules are documented in `crates/salvage-core/src/manifest.rs`.
 
+The recovery run lifecycle state machine in `crates/salvage-core/src/lifecycle/` drives bounded recovery runs through explicit states (`planning`, `validating`, `restoring`, `verifying`, `terminal`, `cleaning`, `cleaned`), tracks resource ownership with isolated process groups and safe child reaping, bounds stages with deadlines and signal cancellation, maintains atomic state persistence and append-only event journaling, and prevents stale resource reuse on re-entry.
+
 ## Verification
 
 Install `cargo-audit` once with `cargo install cargo-audit --locked`, then run the complete local verification path with:
