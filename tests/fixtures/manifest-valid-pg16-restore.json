@@ -1,0 +1,28 @@
+{
+  "schema_version": "v1",
+  "backup": {
+    "digest": "sha256:f49be1627938919ee0a05a667efdf4cb90c303f9b07335814625f11bedcd2454"
+  },
+  "postgres": {
+    "version": "16.4"
+  },
+  "restore": {
+    "source": "local",
+    "type": "full"
+  },
+  "limits": {
+    "cpu_millicores": 500,
+    "memory_mib": 1024,
+    "disk_mib": 5120
+  },
+  "deadlines": {
+    "restore_seconds": 60,
+    "verify_seconds": 30
+  },
+  "evidence": {
+    "destination": "file:///tmp/salvage-evidence"
+  },
+  "run": {
+    "owner": "recovery-drill"
+  }
+}
