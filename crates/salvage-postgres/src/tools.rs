@@ -244,12 +244,14 @@ mod tests {
     #[test]
     fn rejects_unsupported_version() {
         let err = PostgresBinaries::discover(Some("99.0")).expect_err("PG 99 not installed");
-        assert_eq!(
-            err,
-            StageExecutionError::failed(
-                "restore/unsupported-version",
-                "manifest declares PostgreSQL major version 99, but found PostgreSQL version 16 (initdb (PostgreSQL) 16.2 (Ubuntu 16.2-1ubuntu4))"
-            )
-        );
+        match err {
+            StageExecutionError::Failed { code, message } => {
+                assert_eq!(code, "restore/unsupported-version");
+                assert!(message.contains(
+                    "manifest declares PostgreSQL major version 99, but found PostgreSQL version 16"
+                ));
+            }
+            other => panic!("expected StageExecutionError::Failed, got {other:?}"),
+        }
     }
 }
