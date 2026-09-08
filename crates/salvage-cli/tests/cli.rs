@@ -37,13 +37,13 @@ fn check_emits_machine_readable_success() {
 
 #[test]
 fn unsupported_command_emits_machine_readable_usage_error() {
-    let output = run(&["restore"]);
+    let output = run(&["unknown-command"]);
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr).trim(),
-        r#"{"status":"error","code":"usage","message":"expected `salvage check | salvage manifest check <path> | salvage evidence check <path> | salvage evidence report <path>`"}"#
+        r#"{"status":"error","code":"usage","message":"expected `salvage check | salvage manifest check <path> | salvage evidence check <path> | salvage evidence report <path> | salvage run <path> [--backup <path>]`"}"#
     );
 }
 
@@ -151,4 +151,26 @@ fn evidence_report_renders_html() {
     assert!(stdout.contains("Salvage Recovery Evidence"));
     assert!(stdout.contains("drill-20260908-001"));
     assert!(stdout.contains("VERIFIED"));
+}
+
+#[test]
+fn run_without_path_emits_usage_error() {
+    let output = run(&["run"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(r#""status":"error""#));
+    assert!(stderr.contains(r#""code":"usage""#));
+}
+
+#[test]
+fn run_nonexistent_manifest_reports_io_error() {
+    let output = run(&["run", "nonexistent-manifest.json"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(r#""status":"error""#));
+    assert!(stderr.contains(r#""code":"io""#));
 }

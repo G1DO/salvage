@@ -23,5 +23,34 @@ jobs:
       - name: Install cargo-audit
         uses: taiki-e/install-action@cargo-audit
 
+      - name: Ensure PostgreSQL 16 is available
+        run: |
+          if [ -d /usr/lib/postgresql/16/bin ]; then
+            echo "/usr/lib/postgresql/16/bin" >> "$GITHUB_PATH"
+          elif ! command -v initdb >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql-16 postgresql-client-16
+            echo "/usr/lib/postgresql/16/bin" >> "$GITHUB_PATH"
+          fi
+
       - name: Run repository verification
         run: ./scripts/verify.sh
+
+      - name: Run blackbox recovery drill and generate evidence bundle
+        run: |
+          cargo run -p salvage-cli --locked -- run tests/fixtures/manifest-valid-pg16-restore.json \
+            --backup tests/fixtures/valid-pg16-custom.dump \
+            --run-dir target/recovery-evidence
+          ls -la target/recovery-evidence/
+
+      - name: Upload recovery evidence bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-evidence
+          path: |
+            target/recovery-evidence/evidence.json
+            target/recovery-evidence/report.html
+            target/recovery-evidence/journal.jsonl
+            target/recovery-evidence/state.json
+          if-no-files-found: error
+

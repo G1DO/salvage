@@ -38,7 +38,7 @@ impl EphemeralPostgresTarget {
         // Check cancellation & deadline upfront
         if cancellation_token.is_cancelled() {
             return Err(StageExecutionError::cancelled(
-                None,
+                cancellation_token.cancellation_signal(),
                 "cancelled before starting PostgreSQL target",
             ));
         }
@@ -174,7 +174,7 @@ impl EphemeralPostgresTarget {
         loop {
             if cancellation_token.is_cancelled() {
                 return Err(StageExecutionError::cancelled(
-                    None,
+                    cancellation_token.cancellation_signal(),
                     "cancelled while waiting for postgres target readiness",
                 ));
             }

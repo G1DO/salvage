@@ -307,9 +307,10 @@ impl RunEngine {
         })?;
 
         if config.cancellation_token.is_cancelled() {
+            let sig = config.cancellation_token.cancellation_signal();
             final_verdict = Some(Verdict::cancelled(
                 Stage::Validation,
-                None,
+                sig,
                 "cancelled before validation",
             ));
         } else if validation_deadline.is_expired() {
@@ -392,9 +393,10 @@ impl RunEngine {
             })?;
 
             if config.cancellation_token.is_cancelled() {
+                let sig = config.cancellation_token.cancellation_signal();
                 final_verdict = Some(Verdict::cancelled(
                     Stage::Restore,
-                    None,
+                    sig,
                     "cancelled before restore",
                 ));
             } else if restore_deadline.is_expired() {
@@ -479,9 +481,10 @@ impl RunEngine {
             })?;
 
             if config.cancellation_token.is_cancelled() {
+                let sig = config.cancellation_token.cancellation_signal();
                 final_verdict = Some(Verdict::cancelled(
                     Stage::Verification,
-                    None,
+                    sig,
                     "cancelled before verification",
                 ));
             } else if verify_deadline.is_expired() {
