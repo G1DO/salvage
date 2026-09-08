@@ -1,0 +1,43 @@
+{
+  "schema_version": "v99",
+  "completeness": "complete",
+  "run": {
+    "run_id": "drill-unsupported-version",
+    "owner": "recovery-drill",
+    "created_at": "2026-09-08T18:50:00Z"
+  },
+  "tool": {
+    "name": "salvage",
+    "version": "0.1.0"
+  },
+  "manifest": {
+    "canonical_hash": "sha256:f49be1627938919ee0a05a667efdf4cb90c303f9b07335814625f11bedcd2454",
+    "declared": {}
+  },
+  "backup": {
+    "digest": "sha256:f49be1627938919ee0a05a667efdf4cb90c303f9b07335814625f11bedcd2454",
+    "source": "local",
+    "restore_type": "full"
+  },
+  "versions": {
+    "declared_postgres": "16.4"
+  },
+  "limits": {
+    "cpu_millicores": 500,
+    "memory_mib": 1024,
+    "disk_mib": 5120,
+    "restore_seconds": 60,
+    "verify_seconds": 30
+  },
+  "stages": [],
+  "verdict": {
+    "verdict": "passed"
+  },
+  "verdict_classification": "verified",
+  "cleanup": {
+    "status": "success",
+    "errors": []
+  },
+  "events": [],
+  "telemetry": {}
+}

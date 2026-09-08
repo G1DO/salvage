@@ -97,6 +97,7 @@ name = "salvage-cli"
 version = "0.1.0"
 dependencies = [
  "salvage-core",
+ "salvage-evidence",
 ]
 
 [[package]]
@@ -113,6 +114,10 @@ dependencies = [
 [[package]]
 name = "salvage-evidence"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "salvage-postgres"
@@ -120,6 +125,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "salvage-core",
+ "salvage-evidence",
  "serde_json",
  "sha2",
 ]

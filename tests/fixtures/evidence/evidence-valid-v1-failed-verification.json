@@ -1,0 +1,86 @@
+{
+  "schema_version": "v1",
+  "completeness": "complete",
+  "run": {
+    "run_id": "drill-20260908-002",
+    "owner": "recovery-drill",
+    "created_at": "2026-09-08T18:10:00Z",
+    "completed_at": "2026-09-08T18:10:08Z",
+    "total_duration_ms": 8000
+  },
+  "tool": {
+    "name": "salvage",
+    "version": "0.1.0"
+  },
+  "manifest": {
+    "canonical_hash": "sha256:f49be1627938919ee0a05a667efdf4cb90c303f9b07335814625f11bedcd2454",
+    "declared": {
+      "postgres": {
+        "version": "16.4"
+      }
+    }
+  },
+  "backup": {
+    "digest": "sha256:f49be1627938919ee0a05a667efdf4cb90c303f9b07335814625f11bedcd2454",
+    "source": "local",
+    "restore_type": "full"
+  },
+  "versions": {
+    "declared_postgres": "16.4",
+    "observed_server": "PostgreSQL 16.4 on x86_64-pc-linux-gnu",
+    "observed_client": "pg_restore (PostgreSQL) 16.4"
+  },
+  "limits": {
+    "cpu_millicores": 500,
+    "memory_mib": 1024,
+    "disk_mib": 5120,
+    "restore_seconds": 60,
+    "verify_seconds": 30
+  },
+  "stages": [
+    {
+      "stage": "planning",
+      "status": "passed",
+      "duration_ms": 10
+    },
+    {
+      "stage": "validation",
+      "status": "passed",
+      "duration_ms": 110
+    },
+    {
+      "stage": "restore",
+      "status": "passed",
+      "duration_ms": 1400
+    },
+    {
+      "stage": "verification",
+      "status": "failed",
+      "duration_ms": 60
+    },
+    {
+      "stage": "cleaning",
+      "status": "passed",
+      "duration_ms": 75
+    }
+  ],
+  "verdict": {
+    "verdict": "failed",
+    "stage": "verification",
+    "code": "restore/structural-verification-failed",
+    "message": "expected table 'missing_table' was not found in target database"
+  },
+  "verdict_classification": "verification-failed",
+  "cleanup": {
+    "status": "success",
+    "errors": []
+  },
+  "events": [],
+  "telemetry": {
+    "target_dbname": "salvage_restore",
+    "command_identity": "/usr/lib/postgresql/16/bin/pg_restore",
+    "verified_tables": [
+      "users"
+    ]
+  }
+}

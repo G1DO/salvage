@@ -10,3 +10,4 @@ path = "src/main.rs"
 
 [dependencies]
 salvage-core = { path = "../salvage-core" }
+salvage-evidence = { path = "../salvage-evidence" }

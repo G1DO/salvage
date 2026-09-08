@@ -6,6 +6,10 @@ use std::time::{Duration, Instant};
 use crate::manifest::{Manifest, manifest_hash};
 
 use super::cancellation::{CancellationToken, StageDeadline};
+use super::evidence::{
+    RunTelemetry, StageTimingRecord, build_evidence_bundle, persist_evidence,
+    resolve_destination_path, write_initial_incomplete_evidence,
+};
 use super::journal::{EventPayload, Journal, PersistedState, now_rfc3339};
 use super::resource::{ResourceError, ResourceManager, RunId};
 use super::state::{CleanupStatus, RunOutcome, Stage, State, StateError, Verdict};
@@ -26,6 +30,8 @@ pub struct StageContext<'a> {
     pub cancellation_token: &'a CancellationToken,
     /// Journal for recording custom stage events.
     pub journal: &'a Journal,
+    /// Operational telemetry collector.
+    pub telemetry: &'a mut RunTelemetry,
 }
 
 /// Errors returned by stage execution handlers.
@@ -88,6 +94,11 @@ pub trait StageExecutor {
         _ctx: &mut StageContext<'_>,
     ) -> Result<(), StageExecutionError> {
         Ok(())
+    }
+
+    /// Returns captured telemetry if provided by the executor.
+    fn telemetry(&self) -> Option<RunTelemetry> {
+        None
     }
 }
 
@@ -264,6 +275,19 @@ impl RunEngine {
             Ok(())
         };
 
+        let run_start_instant = Instant::now();
+        let mut stage_timings: Vec<StageTimingRecord> = Vec::new();
+        let mut telemetry = RunTelemetry::default();
+
+        // Write initial incomplete evidence bundle
+        let _ = write_initial_incomplete_evidence(&run_id, &manifest, &hash, &run_dir);
+
+        stage_timings.push(StageTimingRecord {
+            stage: "planning".to_owned(),
+            status: "passed".to_owned(),
+            duration_ms: Some(run_start_instant.elapsed().as_millis() as u64),
+        });
+
         // Execution Stages
         let mut final_verdict: Option<Verdict> = None;
 
@@ -274,6 +298,7 @@ impl RunEngine {
             &mut persisted_state,
             &mut current_state,
         )?;
+        let val_start = Instant::now();
         let validation_deadline = StageDeadline::new(Duration::from_secs(60), global_deadline);
 
         journal.record_event(EventPayload::StageStarted {
@@ -298,14 +323,14 @@ impl RunEngine {
                 deadline: &validation_deadline,
                 cancellation_token: &config.cancellation_token,
                 journal: &journal,
+                telemetry: &mut telemetry,
             };
 
-            let start = Instant::now();
             match executor.execute_validation(&mut ctx) {
                 Ok(()) => {
                     journal.record_event(EventPayload::StageCompleted {
                         stage: Stage::Validation,
-                        duration_ms: start.elapsed().as_millis() as u64,
+                        duration_ms: val_start.elapsed().as_millis() as u64,
                     })?;
                 }
                 Err(StageExecutionError::Failed { code, message }) => {
@@ -334,6 +359,18 @@ impl RunEngine {
             }
         }
 
+        stage_timings.push(StageTimingRecord {
+            stage: "validation".to_owned(),
+            status: match &final_verdict {
+                None => "passed".to_owned(),
+                Some(Verdict::Failed { .. }) => "failed".to_owned(),
+                Some(Verdict::TimedOut { .. }) => "timed-out".to_owned(),
+                Some(Verdict::Cancelled { .. }) => "cancelled".to_owned(),
+                Some(Verdict::Passed) => "passed".to_owned(),
+            },
+            duration_ms: Some(val_start.elapsed().as_millis() as u64),
+        });
+
         // Stage 2: Restore
         if final_verdict.is_none() {
             transition_to(
@@ -342,6 +379,7 @@ impl RunEngine {
                 &mut persisted_state,
                 &mut current_state,
             )?;
+            let restore_start = Instant::now();
             let restore_timeout_secs = manifest.deadlines.restore_seconds;
             let restore_deadline = StageDeadline::new(
                 Duration::from_secs(restore_timeout_secs as u64),
@@ -370,14 +408,14 @@ impl RunEngine {
                     deadline: &restore_deadline,
                     cancellation_token: &config.cancellation_token,
                     journal: &journal,
+                    telemetry: &mut telemetry,
                 };
 
-                let start = Instant::now();
                 match executor.execute_restore(&mut ctx) {
                     Ok(()) => {
                         journal.record_event(EventPayload::StageCompleted {
                             stage: Stage::Restore,
-                            duration_ms: start.elapsed().as_millis() as u64,
+                            duration_ms: restore_start.elapsed().as_millis() as u64,
                         })?;
                     }
                     Err(StageExecutionError::Failed { code, message }) => {
@@ -406,6 +444,18 @@ impl RunEngine {
                     }
                 }
             }
+
+            stage_timings.push(StageTimingRecord {
+                stage: "restore".to_owned(),
+                status: match &final_verdict {
+                    None => "passed".to_owned(),
+                    Some(Verdict::Failed { .. }) => "failed".to_owned(),
+                    Some(Verdict::TimedOut { .. }) => "timed-out".to_owned(),
+                    Some(Verdict::Cancelled { .. }) => "cancelled".to_owned(),
+                    Some(Verdict::Passed) => "passed".to_owned(),
+                },
+                duration_ms: Some(restore_start.elapsed().as_millis() as u64),
+            });
         }
 
         // Stage 3: Verification
@@ -416,6 +466,7 @@ impl RunEngine {
                 &mut persisted_state,
                 &mut current_state,
             )?;
+            let verify_start = Instant::now();
             let verify_timeout_secs = manifest.deadlines.verify_seconds;
             let verify_deadline = StageDeadline::new(
                 Duration::from_secs(verify_timeout_secs as u64),
@@ -444,14 +495,14 @@ impl RunEngine {
                     deadline: &verify_deadline,
                     cancellation_token: &config.cancellation_token,
                     journal: &journal,
+                    telemetry: &mut telemetry,
                 };
 
-                let start = Instant::now();
                 match executor.execute_verification(&mut ctx) {
                     Ok(()) => {
                         journal.record_event(EventPayload::StageCompleted {
                             stage: Stage::Verification,
-                            duration_ms: start.elapsed().as_millis() as u64,
+                            duration_ms: verify_start.elapsed().as_millis() as u64,
                         })?;
                         final_verdict = Some(Verdict::Passed);
                     }
@@ -482,9 +533,20 @@ impl RunEngine {
                     }
                 }
             }
+
+            stage_timings.push(StageTimingRecord {
+                stage: "verification".to_owned(),
+                status: match &final_verdict {
+                    None | Some(Verdict::Passed) => "passed".to_owned(),
+                    Some(Verdict::Failed { .. }) => "failed".to_owned(),
+                    Some(Verdict::TimedOut { .. }) => "timed-out".to_owned(),
+                    Some(Verdict::Cancelled { .. }) => "cancelled".to_owned(),
+                },
+                duration_ms: Some(verify_start.elapsed().as_millis() as u64),
+            });
         }
 
-        let verdict = final_verdict.unwrap_or(Verdict::Passed);
+        let mut verdict = final_verdict.unwrap_or(Verdict::Passed);
 
         // Terminal transition
         transition_to(
@@ -502,6 +564,7 @@ impl RunEngine {
             &mut current_state,
         )?;
         journal.record_event(EventPayload::CleanupStarted)?;
+        let clean_start = Instant::now();
 
         let cleanup_status = match resource_manager.release_all() {
             Ok(()) => {
@@ -519,6 +582,99 @@ impl RunEngine {
                 CleanupStatus::failed(errors)
             }
         };
+
+        stage_timings.push(StageTimingRecord {
+            stage: "cleaning".to_owned(),
+            status: if cleanup_status.is_success() {
+                "passed".to_owned()
+            } else {
+                "failed".to_owned()
+            },
+            duration_ms: Some(clean_start.elapsed().as_millis() as u64),
+        });
+
+        // Collect executor telemetry if provided
+        if let Some(exec_telem) = executor.telemetry() {
+            if telemetry.observed_server_version.is_none() {
+                telemetry.observed_server_version = exec_telem.observed_server_version;
+            }
+            if telemetry.observed_client_version.is_none() {
+                telemetry.observed_client_version = exec_telem.observed_client_version;
+            }
+            if telemetry.command_identity.is_none() {
+                telemetry.command_identity = exec_telem.command_identity;
+            }
+            if telemetry.target_dbname.is_none() {
+                telemetry.target_dbname = exec_telem.target_dbname;
+            }
+            if telemetry.verified_tables.is_empty() {
+                telemetry.verified_tables = exec_telem.verified_tables;
+            }
+            telemetry.extra.extend(exec_telem.extra);
+        }
+
+        // Build and persist evidence bundle
+        let completed_at = now_rfc3339();
+        let total_duration_ms = run_start_instant.elapsed().as_millis() as u64;
+        let raw_events = journal.load_events().unwrap_or_default();
+        let json_events: Vec<serde_json::Value> = raw_events
+            .into_iter()
+            .filter_map(|e| serde_json::to_value(e).ok())
+            .collect();
+
+        let bundle = build_evidence_bundle(
+            &run_id,
+            &manifest,
+            &hash,
+            &created_at,
+            Some(completed_at.clone()),
+            Some(total_duration_ms),
+            &stage_timings,
+            Some(&verdict),
+            Some(&cleanup_status),
+            json_events.clone(),
+            &telemetry,
+            salvage_evidence::EvidenceCompleteness::Complete,
+        );
+
+        let mut evidence_write_error: Option<std::io::Error> = None;
+
+        if let Err(e) = persist_evidence(&bundle, &run_dir) {
+            evidence_write_error = Some(e);
+        }
+
+        if let Some(dest_path) = resolve_destination_path(&manifest.evidence.destination)
+            && dest_path != run_dir
+            && let Err(e) = persist_evidence(&bundle, &dest_path)
+        {
+            evidence_write_error.get_or_insert(e);
+        }
+
+        if let Some(write_err) = evidence_write_error {
+            let err_msg = format!("failed to write recovery evidence: {write_err}");
+            let _ = journal.record_event(EventPayload::StageFailed {
+                stage: Stage::Verification,
+                code: "evidence/write-failed".to_owned(),
+                message: err_msg.clone(),
+            });
+            verdict = Verdict::failed(Stage::Verification, "evidence/write-failed", err_msg);
+
+            let updated_bundle = build_evidence_bundle(
+                &run_id,
+                &manifest,
+                &hash,
+                &created_at,
+                Some(completed_at),
+                Some(total_duration_ms),
+                &stage_timings,
+                Some(&verdict),
+                Some(&cleanup_status),
+                json_events,
+                &telemetry,
+                salvage_evidence::EvidenceCompleteness::Complete,
+            );
+            let _ = persist_evidence(&updated_bundle, &run_dir);
+        }
 
         let outcome = RunOutcome::new(verdict, cleanup_status);
         transition_to(

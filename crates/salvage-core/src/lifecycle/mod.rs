@@ -47,6 +47,7 @@
 
 pub mod cancellation;
 pub mod engine;
+pub mod evidence;
 pub mod journal;
 pub mod process;
 pub mod resource;
@@ -57,6 +58,7 @@ pub use engine::{
     DefaultStageExecutor, RunConfig, RunEngine, RunError, StageContext, StageExecutionError,
     StageExecutor,
 };
+pub use evidence::RunTelemetry;
 pub use journal::{EventPayload, Journal, JournalEvent, PersistedState, diagnose_run};
 pub use process::{ProcessHandle, terminate_and_reap_child, terminate_process_group};
 pub use resource::{OwnedResource, ResourceError, ResourceKind, ResourceManager, RunId};

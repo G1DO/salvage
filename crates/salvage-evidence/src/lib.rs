@@ -1,4 +1,21 @@
-//! Types and serialization for machine-readable bootstrap evidence.
+//! Types, redaction, serialization, and report rendering for recovery evidence.
+//!
+//! Evidence is the durable, machine-readable audit trail of a recovery run.
+//! JSON (`evidence.json`) is the canonical source of truth; HTML (`report.html`)
+//! and text projections are generated deterministically from that source.
+
+pub mod bundle;
+pub mod redact;
+pub mod report;
+
+pub use bundle::{
+    BackupEvidence, CleanupEvidence, EvidenceBundle, EvidenceCompleteness, EvidenceError,
+    LimitsEvidence, ManifestEvidence, RunEvidence, SUPPORTED_SCHEMA_VERSION, StageTimingEvidence,
+    TelemetryEvidence, ToolEvidence, VerdictClassification, VerdictEvidence, VersionEvidence,
+    parse_evidence_bundle, parse_evidence_bundle_bytes,
+};
+pub use redact::{REDACTED_PLACEHOLDER, SecretRedactor};
+pub use report::{render_html_report, render_text_report};
 
 /// The result emitted by the workspace bootstrap check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

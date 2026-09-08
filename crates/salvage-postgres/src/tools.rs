@@ -130,14 +130,14 @@ impl PostgresBinaries {
             )
         })?;
 
-        // Extract version from initdb
-        let output = Command::new(&initdb)
+        // Extract version from pg_restore
+        let output = Command::new(&pg_restore)
             .arg("--version")
             .output()
             .map_err(|e| {
                 StageExecutionError::failed(
                     "restore/missing-prerequisite",
-                    format!("failed to execute initdb --version: {e}"),
+                    format!("failed to execute pg_restore --version: {e}"),
                 )
             })?;
 
@@ -221,6 +221,12 @@ mod tests {
     fn parse_major_from_various_strings() {
         assert_eq!(
             extract_major_from_version_string("initdb (PostgreSQL) 16.2 (Ubuntu 16.2-1ubuntu4)"),
+            Some(16)
+        );
+        assert_eq!(
+            extract_major_from_version_string(
+                "pg_restore (PostgreSQL) 16.2 (Ubuntu 16.2-1ubuntu4)"
+            ),
             Some(16)
         );
         assert_eq!(
