@@ -4,11 +4,10 @@ pub mod lifecycle;
 pub mod manifest;
 
 use salvage_evidence::CheckResult;
-use salvage_postgres::Adapter;
 
 /// Runs the non-invasive workspace bootstrap check.
 pub fn workspace_check() -> CheckResult {
-    CheckResult::workspace(Adapter::new().name())
+    CheckResult::workspace("postgres")
 }
 
 #[cfg(test)]

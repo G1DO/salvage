@@ -25,6 +25,8 @@ The bootstrap CLI is intentionally non-invasive. `salvage check` emits one JSON 
 
 The recovery run lifecycle state machine in `crates/salvage-core/src/lifecycle/` drives bounded recovery runs through explicit states (`planning`, `validating`, `restoring`, `verifying`, `terminal`, `cleaning`, `cleaned`), tracks resource ownership with isolated process groups and safe child reaping, bounds stages with deadlines and signal cancellation, maintains atomic state persistence and append-only event journaling, and prevents stale resource reuse on re-entry.
 
+The PostgreSQL adapter in `crates/salvage-postgres/` restores a declared logical backup (`pg_dump -Fc` custom archive) into a fresh, completely isolated ephemeral PostgreSQL target. Before spawning target resources, it validates the backup SHA-256 digest and archive magic bytes (`PGDMP`), failing closed with typed diagnostics (`restore/digest-mismatch`, `restore/corrupt-backup`). It initializes an ephemeral cluster with `initdb` in a scratch directory managed by `ResourceManager`, binds exclusively to a local Unix domain socket (`listen_addresses = ''`), supervises `postgres` and `pg_restore` inside isolated process groups, runs structural table and row verification, and classifies failures into machine-readable diagnostics (`restore/unsupported-version`, `restore/missing-prerequisite`, `restore/structural-verification-failed`, `restore/target-connection-failed`). All resources are reaped and cleaned up in reverse order upon success, failure, timeout, or cancellation.
+
 ## Verification
 
 Install `cargo-audit` once with `cargo install cargo-audit --locked`, then run the complete local verification path with:

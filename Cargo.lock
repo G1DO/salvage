@@ -105,7 +105,6 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "salvage-evidence",
- "salvage-postgres",
  "serde",
  "serde_json",
  "sha2",
@@ -118,6 +117,12 @@ version = "0.1.0"
 [[package]]
 name = "salvage-postgres"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "salvage-core",
+ "serde_json",
+ "sha2",
+]
 
 [[package]]
 name = "serde"
