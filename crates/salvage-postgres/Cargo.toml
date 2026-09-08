@@ -3,3 +3,9 @@ name = "salvage-postgres"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+salvage-core = { path = "../salvage-core" }
+sha2 = "0.10"
+serde_json = "1"
+libc = "0.2"
