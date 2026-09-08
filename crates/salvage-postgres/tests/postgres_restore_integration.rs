@@ -377,3 +377,69 @@ fn test_postgres_restore_stage_timeout_terminates_target_cleanly() {
     assert!(!temp_dir.join("postgres").exists());
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_postgres_restore_generates_complete_evidence_and_report() {
+    let manifest_text = fs::read_to_string(fixture_path("manifest-valid-pg16-restore.json"))
+        .expect("read manifest fixture");
+    let manifest = parse_manifest(&manifest_text).expect("parse manifest");
+
+    let temp_dir = unique_temp_dir("evidence-pg-test");
+    let run_id = RunId::new("test-pg-evidence").unwrap();
+    let config = RunConfig::new(run_id, temp_dir.clone());
+
+    let dump_path = fixture_path("valid-pg16-custom.dump");
+    let mut executor = PostgresStageExecutor::new(dump_path).with_expected_table("salvage_records");
+
+    let outcome = RunEngine::start_run(config, manifest, &mut executor).expect("start run");
+    assert!(outcome.verdict.is_passed());
+
+    let evidence_path = temp_dir.join("evidence.json");
+    let report_path = temp_dir.join("report.html");
+    assert!(
+        evidence_path.exists(),
+        "evidence.json must exist in run_dir"
+    );
+    assert!(report_path.exists(), "report.html must exist in run_dir");
+
+    let content = fs::read_to_string(&evidence_path).expect("read evidence.json");
+    let bundle = salvage_evidence::parse_evidence_bundle(&content).expect("parse bundle");
+
+    assert_eq!(bundle.schema_version, "v1");
+    assert_eq!(
+        bundle.completeness,
+        salvage_evidence::EvidenceCompleteness::Complete
+    );
+    assert_eq!(
+        bundle.verdict_classification,
+        salvage_evidence::VerdictClassification::Verified
+    );
+    assert!(
+        bundle
+            .versions
+            .observed_server
+            .as_deref()
+            .unwrap_or("")
+            .contains("PostgreSQL 16")
+    );
+    assert!(
+        bundle
+            .versions
+            .observed_client
+            .as_deref()
+            .unwrap_or("")
+            .contains("pg_restore")
+    );
+    assert!(
+        bundle
+            .telemetry
+            .verified_tables
+            .contains(&"salvage_records".to_string())
+    );
+
+    let html = fs::read_to_string(&report_path).expect("read report.html");
+    assert!(html.contains("VERIFIED"));
+    assert!(html.contains("test-pg-evidence"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

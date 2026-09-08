@@ -210,7 +210,12 @@ impl State {
 
             (Self::Terminal(v1), Self::Cleaning(v2)) if v1 == v2 => true,
 
-            (Self::Cleaning(v), Self::Cleaned(outcome)) if &outcome.verdict == v => true,
+            (Self::Cleaning(v), Self::Cleaned(outcome))
+                if &outcome.verdict == v
+                    || matches!(&outcome.verdict, Verdict::Failed { code, .. } if code == "evidence/write-failed") =>
+            {
+                true
+            }
 
             _ => false,
         };

@@ -1,0 +1,102 @@
+{
+  "schema_version": "v1",
+  "completeness": "complete",
+  "run": {
+    "run_id": "drill-20260908-001",
+    "owner": "recovery-drill",
+    "created_at": "2026-09-08T18:00:00Z",
+    "completed_at": "2026-09-08T18:00:12Z",
+    "total_duration_ms": 12000
+  },
+  "tool": {
+    "name": "salvage",
+    "version": "0.1.0"
+  },
+  "manifest": {
+    "canonical_hash": "sha256:f49be1627938919ee0a05a667efdf4cb90c303f9b07335814625f11bedcd2454",
+    "declared": {
+      "backup": {
+        "digest": "sha256:f49be1627938919ee0a05a667efdf4cb90c303f9b07335814625f11bedcd2454"
+      },
+      "postgres": {
+        "version": "16.4"
+      }
+    }
+  },
+  "backup": {
+    "digest": "sha256:f49be1627938919ee0a05a667efdf4cb90c303f9b07335814625f11bedcd2454",
+    "source": "local",
+    "restore_type": "full"
+  },
+  "versions": {
+    "declared_postgres": "16.4",
+    "observed_server": "PostgreSQL 16.4 on x86_64-pc-linux-gnu",
+    "observed_client": "pg_restore (PostgreSQL) 16.4"
+  },
+  "limits": {
+    "cpu_millicores": 500,
+    "memory_mib": 1024,
+    "disk_mib": 5120,
+    "restore_seconds": 60,
+    "verify_seconds": 30
+  },
+  "stages": [
+    {
+      "stage": "planning",
+      "status": "passed",
+      "duration_ms": 15
+    },
+    {
+      "stage": "validation",
+      "status": "passed",
+      "duration_ms": 120
+    },
+    {
+      "stage": "restore",
+      "status": "passed",
+      "duration_ms": 1500
+    },
+    {
+      "stage": "verification",
+      "status": "passed",
+      "duration_ms": 55
+    },
+    {
+      "stage": "cleaning",
+      "status": "passed",
+      "duration_ms": 80
+    }
+  ],
+  "verdict": {
+    "verdict": "passed"
+  },
+  "verdict_classification": "verified",
+  "cleanup": {
+    "status": "success",
+    "errors": []
+  },
+  "events": [
+    {
+      "timestamp_rfc3339": "2026-09-08T18:00:00Z",
+      "run_id": "drill-20260908-001",
+      "event": "stage-started",
+      "stage": "validation",
+      "deadline_seconds": 60
+    },
+    {
+      "timestamp_rfc3339": "2026-09-08T18:00:01Z",
+      "run_id": "drill-20260908-001",
+      "event": "stage-completed",
+      "stage": "validation",
+      "duration_ms": 120
+    }
+  ],
+  "telemetry": {
+    "target_dbname": "salvage_restore",
+    "command_identity": "/usr/lib/postgresql/16/bin/pg_restore",
+    "verified_tables": [
+      "users",
+      "accounts"
+    ]
+  }
+}

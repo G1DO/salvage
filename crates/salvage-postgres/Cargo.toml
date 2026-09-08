@@ -9,3 +9,6 @@ salvage-core = { path = "../salvage-core" }
 sha2 = "0.10"
 serde_json = "1"
 libc = "0.2"
+
+[dev-dependencies]
+salvage-evidence = { path = "../salvage-evidence" }

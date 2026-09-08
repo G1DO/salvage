@@ -1,0 +1,6 @@
+{
+  "schema_version": "v1",
+  "completeness": "complete",
+  "run": {
+    "run_id": "drill-corrupted-file",
+    "owner": "recovery-drill"

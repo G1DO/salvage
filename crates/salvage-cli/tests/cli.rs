@@ -15,6 +15,14 @@ fn manifest_fixture(name: &str) -> String {
         .into_owned()
 }
 
+fn evidence_fixture(name: &str) -> String {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    root.join("../../tests/fixtures/evidence")
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[test]
 fn check_emits_machine_readable_success() {
     let output = run(&["check"]);
@@ -35,7 +43,7 @@ fn unsupported_command_emits_machine_readable_usage_error() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr).trim(),
-        r#"{"status":"error","code":"usage","message":"expected `salvage check | salvage manifest check <path>`"}"#
+        r#"{"status":"error","code":"usage","message":"expected `salvage check | salvage manifest check <path> | salvage evidence check <path> | salvage evidence report <path>`"}"#
     );
 }
 
@@ -83,4 +91,64 @@ fn manifest_check_reports_non_utf8_input_as_parse_error() {
         stderr.contains(r#""status":"error""#) && stderr.contains(r#""code":"manifest/parse""#),
         "unexpected stderr: {stderr}"
     );
+}
+
+#[test]
+fn evidence_check_accepts_valid_complete_bundle() {
+    let path = evidence_fixture("evidence-valid-v1-verified.json");
+    let output = run(&["evidence", "check", &path]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#""status":"ok""#)
+            && stdout.contains(r#""command":"evidence-check""#)
+            && stdout.contains(r#""completeness":"complete""#)
+            && stdout.contains(r#""verdict_classification":"verified""#),
+        "unexpected stdout: {stdout}"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn evidence_check_rejects_incomplete_bundle() {
+    let path = evidence_fixture("evidence-valid-v1-incomplete.json");
+    let output = run(&["evidence", "check", &path]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(r#""status":"error""#)
+            && stderr.contains(r#""code":"evidence/incomplete""#),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+#[test]
+fn evidence_check_rejects_unsupported_version() {
+    let path = evidence_fixture("evidence-invalid-unsupported-version.json");
+    let output = run(&["evidence", "check", &path]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(r#""status":"error""#)
+            && stderr.contains(r#""code":"evidence/unsupported-version""#),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+#[test]
+fn evidence_report_renders_html() {
+    let path = evidence_fixture("evidence-valid-v1-verified.json");
+    let output = run(&["evidence", "report", &path]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("<!DOCTYPE html>"));
+    assert!(stdout.contains("Salvage Recovery Evidence"));
+    assert!(stdout.contains("drill-20260908-001"));
+    assert!(stdout.contains("VERIFIED"));
 }

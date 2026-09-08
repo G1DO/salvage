@@ -1,0 +1,64 @@
+{
+  "schema_version": "v1",
+  "completeness": "complete",
+  "run": {
+    "run_id": "drill-20260908-003",
+    "owner": "recovery-drill",
+    "created_at": "2026-09-08T18:20:00Z",
+    "completed_at": "2026-09-08T18:20:02Z",
+    "total_duration_ms": 2000
+  },
+  "tool": {
+    "name": "salvage",
+    "version": "0.1.0"
+  },
+  "manifest": {
+    "canonical_hash": "sha256:f49be1627938919ee0a05a667efdf4cb90c303f9b07335814625f11bedcd2454",
+    "declared": {}
+  },
+  "backup": {
+    "digest": "sha256:f49be1627938919ee0a05a667efdf4cb90c303f9b07335814625f11bedcd2454",
+    "source": "local",
+    "restore_type": "full"
+  },
+  "versions": {
+    "declared_postgres": "99.0"
+  },
+  "limits": {
+    "cpu_millicores": 500,
+    "memory_mib": 1024,
+    "disk_mib": 5120,
+    "restore_seconds": 60,
+    "verify_seconds": 30
+  },
+  "stages": [
+    {
+      "stage": "planning",
+      "status": "passed",
+      "duration_ms": 10
+    },
+    {
+      "stage": "validation",
+      "status": "failed",
+      "duration_ms": 15
+    },
+    {
+      "stage": "cleaning",
+      "status": "passed",
+      "duration_ms": 30
+    }
+  ],
+  "verdict": {
+    "verdict": "failed",
+    "stage": "validation",
+    "code": "restore/unsupported-version",
+    "message": "no PostgreSQL binaries found matching declared major version 99"
+  },
+  "verdict_classification": "orchestration-failed",
+  "cleanup": {
+    "status": "success",
+    "errors": []
+  },
+  "events": [],
+  "telemetry": {}
+}

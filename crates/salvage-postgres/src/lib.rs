@@ -113,6 +113,8 @@ impl StageExecutor for PostgresStageExecutor {
 
         self.telemetry.client_version = Some(binaries.version_str.clone());
         self.telemetry.restore_command = Some(binaries.pg_restore.display().to_string());
+        ctx.telemetry.observed_client_version = Some(binaries.version_str.clone());
+        ctx.telemetry.command_identity = Some(binaries.pg_restore.display().to_string());
         self.binaries = Some(binaries);
         Ok(())
     }
@@ -138,8 +140,10 @@ impl StageExecutor for PostgresStageExecutor {
 
         // Query server version
         let server_version = target.server_version()?;
-        self.telemetry.server_version = Some(server_version);
+        self.telemetry.server_version = Some(server_version.clone());
         self.telemetry.target_dbname = Some(self.target_dbname.clone());
+        ctx.telemetry.observed_server_version = Some(server_version);
+        ctx.telemetry.target_dbname = Some(self.target_dbname.clone());
 
         // 2. Execute pg_restore
         let duration = execute_restore(
@@ -158,8 +162,20 @@ impl StageExecutor for PostgresStageExecutor {
             &self.target_dbname,
             self.expected_table.as_deref(),
         )?;
-        self.telemetry.verified_tables = verified_tables;
+        self.telemetry.verified_tables = verified_tables.clone();
+        ctx.telemetry.verified_tables = verified_tables;
 
         Ok(())
+    }
+
+    fn telemetry(&self) -> Option<salvage_core::lifecycle::RunTelemetry> {
+        Some(salvage_core::lifecycle::RunTelemetry {
+            observed_server_version: self.telemetry.server_version.clone(),
+            observed_client_version: self.telemetry.client_version.clone(),
+            command_identity: self.telemetry.restore_command.clone(),
+            target_dbname: self.telemetry.target_dbname.clone(),
+            verified_tables: self.telemetry.verified_tables.clone(),
+            extra: Default::default(),
+        })
     }
 }
