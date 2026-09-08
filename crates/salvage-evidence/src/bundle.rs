@@ -3,6 +3,20 @@
 //! An evidence bundle is the durable, machine-readable audit trail of a recovery run.
 //! It records run identity, declared and observed versions, effective limits, stage
 //! timings, structured events, primary verdict, cleanup result, and explicit completeness.
+//!
+//! # Determinism and Non-Deterministic Fields
+//!
+//! Evidence bundles are semantically reproducible across identical inputs and environments.
+//! Exactly the following fields are runtime-dependent and non-deterministic:
+//! - `run.run_id`: unique run identifier generated per execution
+//! - `run.created_at`, `run.completed_at`: RFC3339 timestamps
+//! - `run.total_duration_ms`: total wall-clock duration of the run
+//! - `stages[*].duration_ms`: elapsed duration for each stage execution
+//! - `events[*].timestamp_rfc3339`, `events[*].run_id`, `events[*].duration_ms`: event timestamps, run identifiers, and stage elapsed timings
+//!
+//! All other fields (manifest hash, declared config, observed versions, verdicts,
+//! classifications, cleanup status, verified tables, and stage transition sequences)
+//! are strictly deterministic.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

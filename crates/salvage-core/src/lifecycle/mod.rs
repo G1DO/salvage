@@ -53,7 +53,9 @@ pub mod process;
 pub mod resource;
 pub mod state;
 
-pub use cancellation::{CancellationToken, StageDeadline};
+pub use cancellation::{
+    CancellationToken, StageDeadline, install_signal_handler, reset_signal_state,
+};
 pub use engine::{
     DefaultStageExecutor, RunConfig, RunEngine, RunError, StageContext, StageExecutionError,
     StageExecutor,
