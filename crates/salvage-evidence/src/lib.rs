@@ -9,10 +9,10 @@ pub mod redact;
 pub mod report;
 
 pub use bundle::{
-    BackupEvidence, CleanupEvidence, EvidenceBundle, EvidenceCompleteness, EvidenceError,
-    LimitsEvidence, ManifestEvidence, RunEvidence, SUPPORTED_SCHEMA_VERSION, StageTimingEvidence,
-    TelemetryEvidence, ToolEvidence, VerdictClassification, VerdictEvidence, VersionEvidence,
-    parse_evidence_bundle, parse_evidence_bundle_bytes,
+    ArtifactEvidence, BackupEvidence, CleanupEvidence, EvidenceBundle, EvidenceCompleteness,
+    EvidenceError, LimitsEvidence, ManifestEvidence, RunEvidence, SUPPORTED_SCHEMA_VERSION,
+    StageTimingEvidence, TelemetryEvidence, ToolEvidence, VerdictClassification, VerdictEvidence,
+    VersionEvidence, parse_evidence_bundle, parse_evidence_bundle_bytes,
 };
 pub use redact::{REDACTED_PLACEHOLDER, SecretRedactor};
 pub use report::{render_html_report, render_text_report};
