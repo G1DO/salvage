@@ -1,21 +1,11 @@
 [package]
-name = "salvage-cli"
+name = "salvage-oci"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
-[[bin]]
-name = "salvage"
-path = "src/main.rs"
-
 [dependencies]
 salvage-core = { path = "../salvage-core" }
-salvage-evidence = { path = "../salvage-evidence" }
 salvage-postgres = { path = "../salvage-postgres" }
-salvage-oci = { path = "../salvage-oci" }
-sha2 = "0.10"
-
-[dev-dependencies]
-libc = "0.2"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-

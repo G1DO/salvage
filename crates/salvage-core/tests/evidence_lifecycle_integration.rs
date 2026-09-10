@@ -68,6 +68,12 @@ impl StageExecutor for MockTelemetryExecutor {
             observed_client_version: Some(self.observed_client.clone()),
             command_identity: Some("/usr/bin/pg_restore".to_owned()),
             target_dbname: Some("mock_db".to_owned()),
+            observed_app_version: None,
+            observed_artifact_digest: None,
+            declared_artifact_digest: None,
+            artifact_repository: None,
+            artifact_resolved_image_id: None,
+            boot_seconds: None,
             verified_tables: self.verified_tables.clone(),
             extra: Default::default(),
         })

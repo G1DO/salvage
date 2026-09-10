@@ -14,6 +14,8 @@ pub enum Stage {
     Restore,
     /// Recovery verification placeholder.
     Verification,
+    /// Application OCI boot and readiness probing (v2 manifests only).
+    Boot,
 }
 
 impl std::fmt::Display for Stage {
@@ -23,6 +25,7 @@ impl std::fmt::Display for Stage {
             Self::Validation => write!(f, "validation"),
             Self::Restore => write!(f, "restore"),
             Self::Verification => write!(f, "verification"),
+            Self::Boot => write!(f, "boot"),
         }
     }
 }
@@ -149,6 +152,8 @@ pub enum State {
     Restoring,
     /// Verifying restore integrity.
     Verifying,
+    /// Booting the application artifact (v2 manifests only).
+    Booting,
     /// Stage execution concluded with a primary verdict.
     Terminal(Verdict),
     /// Active resource cleanup.
@@ -162,7 +167,7 @@ impl State {
     pub const fn is_active(&self) -> bool {
         matches!(
             self,
-            Self::Planning | Self::Validating | Self::Restoring | Self::Verifying
+            Self::Planning | Self::Validating | Self::Restoring | Self::Verifying | Self::Booting
         )
     }
 
@@ -188,6 +193,7 @@ impl State {
             Self::Validating => "validating",
             Self::Restoring => "restoring",
             Self::Verifying => "verifying",
+            Self::Booting => "booting",
             Self::Terminal(_) => "terminal",
             Self::Cleaning(_) => "cleaning",
             Self::Cleaned(_) => "cleaned",
@@ -206,7 +212,12 @@ impl State {
             (Self::Restoring, Self::Verifying) => true,
             (Self::Restoring, Self::Terminal(_)) => true,
 
+            // v1 short-circuits verification directly to terminal; v2
+            // proceeds through the boot stage first.
             (Self::Verifying, Self::Terminal(_)) => true,
+            (Self::Verifying, Self::Booting) => true,
+
+            (Self::Booting, Self::Terminal(_)) => true,
 
             (Self::Terminal(v1), Self::Cleaning(v2)) if v1 == v2 => true,
 
@@ -273,6 +284,12 @@ mod tests {
 
         state.transition_to(State::Verifying).unwrap();
         assert_eq!(state, State::Verifying);
+        assert!(state.is_active());
+
+        state.transition_to(State::Booting).unwrap();
+        assert_eq!(state, State::Booting);
+        assert_eq!(state.name(), "booting");
+        assert!(state.is_active());
 
         state
             .transition_to(State::Terminal(Verdict::Passed))
@@ -338,6 +355,73 @@ mod tests {
             terminal.transition_to(mismatched).unwrap_err(),
             StateError::IllegalTransition {
                 from: "terminal".to_owned(),
+                to: "cleaning".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn v1_direct_verifying_to_terminal_remains_legal() {
+        // v1 runs declare no boot stage and short-circuit verification to terminal.
+        let mut state = State::Verifying;
+        state
+            .transition_to(State::Terminal(Verdict::Passed))
+            .unwrap();
+        assert!(state.is_terminal());
+    }
+
+    #[test]
+    fn boot_stage_wraps_up_into_terminal() {
+        let mut state = State::Verifying;
+        state.transition_to(State::Booting).unwrap();
+        assert_eq!(Stage::Boot.to_string(), "boot");
+        let verdict = Verdict::failed(Stage::Boot, "boot/readiness", "probe timed out");
+        state
+            .transition_to(State::Terminal(verdict.clone()))
+            .unwrap();
+        state
+            .transition_to(State::Cleaning(verdict.clone()))
+            .unwrap();
+        state
+            .transition_to(State::Cleaned(RunOutcome::new(
+                verdict,
+                CleanupStatus::Success,
+            )))
+            .unwrap();
+        assert!(state.is_cleaned());
+    }
+
+    #[test]
+    fn illegal_boot_transitions_are_rejected() {
+        // Boot cannot be entered except from verification.
+        for from in [State::Planning, State::Validating, State::Restoring] {
+            let mut state = from.clone();
+            let from_name = state.name().to_owned();
+            assert_eq!(
+                state.transition_to(State::Booting).unwrap_err(),
+                StateError::IllegalTransition {
+                    from: from_name,
+                    to: "booting".to_owned(),
+                }
+            );
+        }
+
+        // Boot cannot go back or skip terminal.
+        let mut booting = State::Booting;
+        assert_eq!(
+            booting.transition_to(State::Verifying).unwrap_err(),
+            StateError::IllegalTransition {
+                from: "booting".to_owned(),
+                to: "verifying".to_owned(),
+            }
+        );
+        let mut booting = State::Booting;
+        assert_eq!(
+            booting
+                .transition_to(State::Cleaning(Verdict::Passed))
+                .unwrap_err(),
+            StateError::IllegalTransition {
+                from: "booting".to_owned(),
                 to: "cleaning".to_owned(),
             }
         );

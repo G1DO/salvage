@@ -43,3 +43,17 @@ Install `cargo-audit` once with `cargo install cargo-audit --locked`, then run t
 ```
 
 The script checks formatting, clippy warnings, workspace tests, the locked dependency graph, and the intentional compile-fail fixture in `tests/fixtures/invalid.rs`. CI runs the same command, then performs a PostgreSQL 16 black-box recovery drill and uploads its evidence bundle as an artifact.
+
+## V2 Boot Artifact Drill
+
+`v2` manifests introduce exact OCI application artifact identity (`app.digest`, `app.repository`, optional `app.tag`), readiness probe declarations (`tcp`, `http`, `exec`), and `deadlines.boot_seconds`. The boot stage pulls the artifact strictly by digest, maps ephemeral ports, probes readiness, re-verifies structural integrity post-boot, and records artifact metadata and boot duration in evidence. `v1` bundles remain frozen and byte-identical.
+
+Drill scenarios:
+
+- **Happy path**: Run `salvage run` with a `v2` manifest and valid PostgreSQL backup. Container starts detached, passes readiness probes, and exits cleanly with verdict `verified` and full evidence.
+- **Digest mismatch**: An image not matching declared `app.digest` fails closed with diagnostic `app/digest-mismatch` without leaking containers.
+- **Application crash**: Container early exits during boot map directly to `app/crash`.
+- **Readiness timeout**: Unresponsive containers exceeding `deadlines.boot_seconds` fail with `timed-out`.
+- **Signal cancellation**: `SIGINT`/`SIGTERM` during boot triggers immediate graceful container shutdown (`docker rm -f`) and produces a `cancelled` verdict.
+- **Zero leaks**: Every execution path guarantees zero leaked containers or PostgreSQL processes.
+

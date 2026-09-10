@@ -43,7 +43,7 @@ fn unsupported_command_emits_machine_readable_usage_error() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr).trim(),
-        r#"{"status":"error","code":"usage","message":"expected `salvage check | salvage manifest check <path> | salvage evidence check <path> | salvage evidence report <path> | salvage run <path> [--backup <path>]`"}"#
+        r#"{"status":"error","code":"usage","message":"expected `salvage check | salvage manifest check <path> | salvage evidence check <path> | salvage evidence report <path> | salvage run <path> [--backup <path>] [--artifact <repo@sha256:...>]`"}"#
     );
 }
 
