@@ -41,3 +41,17 @@ Install `cargo-audit` once with `cargo install cargo-audit --locked`, then run t
 ```
 
 The script checks formatting, clippy warnings, workspace tests, the locked dependency graph, and the intentional compile-fail fixture in `tests/fixtures/invalid.rs`. CI runs the same command.
+
+
+## V2 boot artifact drill
+
+V2 manifests add app plus readiness and deadlines boot seconds. The boot stage pulls by digest, probes readiness, re-verifies tables post-boot, and records artifact plus boot seconds in evidence. V1 bundles stay byte identical.
+
+Tiny drill commands:
+
+- Build tiny images from crates salvage-oci tests fixtures images tiny-http and tests fixtures images tiny-crash and tiny-hang
+- Run v2 happy with valid v2 boot tcp manifest plus backup dump plus run dir, replacing app digest with built image ID
+- Wrong digest fails closed with app digest-mismatch and boot failed and no container leaked
+- Crash CMD false maps to app crash, hang sleep with boot seconds 5 maps to timed out, SIGINT mid-boot maps to cancelled
+- All runs guarantee zero leaked containers via docker ps filter and postgres directory removed
+- Evidence includes artifact digest repository resolved image and observed version plus limits boot seconds when present, report shows conditional Artifact rows and BOOT FAILED badge

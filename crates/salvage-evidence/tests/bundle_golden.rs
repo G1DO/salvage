@@ -130,3 +130,17 @@ fn rejects_empty_file() {
     let err = parse_evidence_bundle_bytes(&[]).expect_err("should reject empty bytes");
     assert!(matches!(err, EvidenceError::Corrupt { .. }));
 }
+
+#[test]
+fn v1_bundle_without_artifact_is_byte_identical() {
+    let content =
+        fs::read_to_string(fixture_path("evidence-valid-v1-verified.json")).expect("read");
+    let bundle = parse_evidence_bundle(&content).expect("parse");
+    assert!(bundle.artifact.is_none());
+    assert!(bundle.limits.boot_seconds.is_none());
+    let json = bundle.to_canonical_json().expect("ser");
+    assert!(!json.contains("artifact"));
+    assert!(!json.contains("boot_seconds"));
+    let again = parse_evidence_bundle(&json).expect("reparse");
+    assert_eq!(bundle, again);
+}

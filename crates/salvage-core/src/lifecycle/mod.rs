@@ -7,7 +7,12 @@
 //! # States and Transitions
 //!
 //! The lifecycle flows through defined states:
-//! `Planning` -> `Validating` -> `Restoring` -> `Verifying` -> `Terminal(Verdict)` -> `Cleaning` -> `Cleaned(RunOutcome)`
+//! `Planning` -> `Validating` -> `Restoring` -> `Verifying` -> (`Booting` ->) `Terminal(Verdict)` -> `Cleaning` -> `Cleaned(RunOutcome)`
+//!
+//! v1 manifests short-circuit `Verifying` directly to `Terminal`; v2 manifests
+//! (O2 Slice 1) declare `deadlines.boot_seconds` and run the `Boot` stage
+//! (`State::Booting`) after successful verification via
+//! `RunEngine::start_run_v2` (see `BootPolicy`).
 //!
 //! Any illegal transition returns [`StateError::IllegalTransition`].
 //!
@@ -57,8 +62,8 @@ pub use cancellation::{
     CancellationToken, StageDeadline, install_signal_handler, reset_signal_state,
 };
 pub use engine::{
-    DefaultStageExecutor, RunConfig, RunEngine, RunError, StageContext, StageExecutionError,
-    StageExecutor,
+    BootPolicy, DefaultStageExecutor, RunConfig, RunEngine, RunError, StageContext,
+    StageExecutionError, StageExecutor,
 };
 pub use evidence::RunTelemetry;
 pub use journal::{EventPayload, Journal, JournalEvent, PersistedState, diagnose_run};
