@@ -349,18 +349,38 @@ fn docker_logs_tail(
 
 fn redact_logs(text: &str) -> String {
     let mut out = text.to_owned();
+    // Mirror SecretRedactor env coverage: any secret-like env value is
+    // replaced exactly, not just PASSWORD/SECRET/TOKEN.
     for (key, val) in std::env::vars() {
         let upper = key.to_uppercase();
-        if (upper.contains("PASSWORD") || upper.contains("SECRET") || upper.contains("TOKEN"))
+        if (upper.contains("PASS")
+            || upper.contains("SECRET")
+            || upper.contains("TOKEN")
+            || upper.contains("KEY")
+            || upper.contains("AUTH")
+            || upper.contains("CREDENTIAL")
+            || upper.contains("DOCKER")
+            || upper.contains("REGISTRY")
+            || upper.contains("GHCR")
+            || upper.contains("ECR"))
             && !val.is_empty()
+            && val.len() >= 3
         {
             out = out.replace(&val, "[REDACTED]");
         }
     }
+    out = redact_uri_passwords(&out);
     out.lines()
         .map(|line| {
             let lower = line.to_lowercase();
-            if lower.contains("password") || lower.contains("secret") || lower.contains("token") {
+            if lower.contains("password")
+                || lower.contains("secret")
+                || lower.contains("token")
+                || lower.contains("private key")
+                || lower.contains("bearer ")
+                || lower.contains("authorization:")
+                || lower.contains("database_url")
+            {
                 "[REDACTED log line]".to_string()
             } else {
                 line.to_string()
@@ -368,6 +388,56 @@ fn redact_logs(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Redact `scheme://user:password@host` passwords without a regex engine.
+fn redact_uri_passwords(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(scheme_end) = find_scheme(input, i) {
+            let after_scheme = scheme_end + 3;
+            if let Some(at) = input[after_scheme..].find('@') {
+                let host_part = &input[after_scheme..after_scheme + at];
+                if let Some(colon) = host_part.rfind(':') {
+                    let pass_start = after_scheme + colon + 1;
+                    let pass_end = after_scheme + at;
+                    if pass_start < pass_end {
+                        out.push_str(&input[i..pass_start]);
+                        out.push_str("[REDACTED]");
+                        i = pass_end;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn find_scheme(input: &str, from: usize) -> Option<usize> {
+    let rest = &input[from..];
+    for (idx, _) in rest.char_indices() {
+        if rest[idx..].starts_with("://") {
+            return Some(from + idx);
+        }
+        // Bound the scan so pathological lines stay linear.
+        if idx > 512 {
+            break;
+        }
+        let c = rest.as_bytes().get(idx).copied().unwrap_or(0);
+        if !(c.is_ascii_alphanumeric() || c == b'+' || c == b'-' || c == b'.' || c == b':') {
+            // Allow spaces before scheme start; break on other delimiters
+            // only after consuming a plausible scheme token.
+            if c == b' ' || c == b'\t' || c == b'\n' || c == b'"' || c == b'\'' {
+                continue;
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

@@ -35,13 +35,13 @@ pub fn ensure_image(
     }
     let pinned = pinned_ref(app);
     match try_inspect(runtime, &pinned, resources, deadline, cancel)? {
-        Some(image_id) => {
+        Some(inspected) => {
             verify_digest_match(
-                runtime, app, &pinned, &image_id, resources, deadline, cancel,
+                runtime, app, &pinned, &inspected, resources, deadline, cancel,
             )?;
             Ok(ImageIdentity {
                 declared_digest: app.digest.clone(),
-                image_id,
+                image_id: inspected.image_id,
                 pinned_ref: pinned,
             })
         }
@@ -58,13 +58,13 @@ pub fn ensure_image(
             }
             pull_image(runtime, &pinned, resources, deadline, cancel)?;
             match try_inspect(runtime, &pinned, resources, deadline, cancel)? {
-                Some(image_id) => {
+                Some(inspected) => {
                     verify_digest_match(
-                        runtime, app, &pinned, &image_id, resources, deadline, cancel,
+                        runtime, app, &pinned, &inspected, resources, deadline, cancel,
                     )?;
                     Ok(ImageIdentity {
                         declared_digest: app.digest.clone(),
-                        image_id,
+                        image_id: inspected.image_id,
                         pinned_ref: pinned,
                     })
                 }
@@ -84,13 +84,19 @@ fn pinned_ref(app: &AppArtifact) -> String {
     }
 }
 
+#[derive(Debug, Clone)]
+struct InspectedImage {
+    image_id: String,
+    repo_digests: Vec<String>,
+}
+
 fn try_inspect(
     runtime: &ContainerRuntime,
     pinned: &str,
     resources: &mut ResourceManager,
     deadline: &StageDeadline,
     cancel: &CancellationToken,
-) -> Result<Option<String>, StageExecutionError> {
+) -> Result<Option<InspectedImage>, StageExecutionError> {
     let out = run_docker(
         runtime.bin(),
         &["image", "inspect", pinned],
@@ -103,8 +109,8 @@ fn try_inspect(
             if !output.status_success {
                 return Ok(None);
             }
-            match parse_image_id(&output.stdout, pinned) {
-                Some(id) => Ok(Some(id)),
+            match parse_inspect(&output.stdout) {
+                Some(inspected) => Ok(Some(inspected)),
                 None => Err(StageExecutionError::failed(
                     "app/digest-mismatch",
                     format!("image inspect for {} returned unparsable output", pinned),
@@ -131,7 +137,7 @@ fn verify_digest_match(
     _runtime: &ContainerRuntime,
     app: &AppArtifact,
     pinned: &str,
-    _image_id: &str,
+    inspected: &InspectedImage,
     _resources: &mut ResourceManager,
     _deadline: &StageDeadline,
     _cancel: &CancellationToken,
@@ -144,12 +150,32 @@ fn verify_digest_match(
                 format!("pinned ref {} does not match expected {}", pinned, expected),
             ));
         }
+        // Exact artifact check: docker records the manifest digest in
+        // RepoDigests on pull-by-digest. Image Id (config hash) is NOT the
+        // manifest digest, so Id equality alone would accept the wrong image.
+        if !inspected.repo_digests.iter().any(|d| d == &expected) {
+            return Err(StageExecutionError::failed(
+                "app/digest-mismatch",
+                format!(
+                    "image {} RepoDigests does not contain declared {} (observed {} entries)",
+                    pinned,
+                    expected,
+                    inspected.repo_digests.len(),
+                ),
+            ));
+        }
         return Ok(());
     }
-    if !pinned.contains(&app.digest) {
+    // Repository-less (hermetic fixture) case: digest is the local image Id.
+    // Require exact equality — docker accepts short-Id prefixes on inspect,
+    // so a prefix match must not count as verified.
+    if inspected.image_id != app.digest {
         return Err(StageExecutionError::failed(
             "app/digest-mismatch",
-            "digest mismatch for repository-less image".to_string(),
+            format!(
+                "image Id {} does not exactly match declared {}",
+                inspected.image_id, app.digest,
+            ),
         ));
     }
     Ok(())
@@ -185,7 +211,7 @@ fn pull_image(
     Ok(())
 }
 
-fn parse_image_id(stdout: &str, _pinned: &str) -> Option<String> {
+fn parse_inspect(stdout: &str) -> Option<InspectedImage> {
     let v: serde_json::Value = serde_json::from_str(stdout).ok()?;
     let arr = v.as_array()?;
     let first = arr.first()?;
@@ -193,7 +219,20 @@ fn parse_image_id(stdout: &str, _pinned: &str) -> Option<String> {
     if id.is_empty() {
         return None;
     }
-    Some(id.to_owned())
+    let mut repo_digests = Vec::new();
+    if let Some(digests) = first.get("RepoDigests")
+        && let Some(list) = digests.as_array()
+    {
+        for entry in list {
+            if let Some(s) = entry.as_str() {
+                repo_digests.push(s.to_owned());
+            }
+        }
+    }
+    Some(InspectedImage {
+        image_id: id.to_owned(),
+        repo_digests,
+    })
 }
 
 struct DockerOutput {
@@ -384,5 +423,105 @@ exit 1
             )
         );
         assert!(!pinned.contains("v1.2.3"));
+    }
+
+    #[test]
+    fn repo_digests_must_contain_declared_digest() {
+        let digest = "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let app = test_app(Some("registry.example.com/team/app"), digest);
+        let expected = format!("registry.example.com/team/app@{digest}");
+        let ok_json = format!(
+            r#"[{{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","RepoDigests":["{expected}"]}}]"#
+        );
+        let inspected = parse_inspect(&ok_json).expect("must parse");
+        assert_eq!(inspected.repo_digests, vec![expected.clone()]);
+        let base =
+            std::env::temp_dir().join(format!("salvage-image-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let run_id = salvage_core::lifecycle::RunId::new("img-verify-ok").unwrap();
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut rm = ResourceManager::new(run_id, root);
+        let deadline = StageDeadline::new(Duration::from_secs(10), None);
+        let cancel = CancellationToken::new();
+        let rt = fake_runtime(&PathBuf::from("docker"));
+        verify_digest_match(
+            &rt, &app, &expected, &inspected, &mut rm, &deadline, &cancel,
+        )
+        .expect("RepoDigests match must verify");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn repo_digests_missing_entry_is_mismatch() {
+        let digest = "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let app = test_app(Some("registry.example.com/team/app"), digest);
+        let expected = format!("registry.example.com/team/app@{digest}");
+        // Same Id but different RepoDigest (wrong image): Id equality alone
+        // must NOT verify.
+        let wrong_json = r#"[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","RepoDigests":["registry.example.com/team/app@sha256:0000000000000000000000000000000000000000000000000000000000000000"]}]"#;
+        let inspected = parse_inspect(wrong_json).expect("must parse");
+        let base =
+            std::env::temp_dir().join(format!("salvage-image-verify-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let run_id = salvage_core::lifecycle::RunId::new("img-verify-bad").unwrap();
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut rm = ResourceManager::new(run_id, root);
+        let deadline = StageDeadline::new(Duration::from_secs(10), None);
+        let cancel = CancellationToken::new();
+        let rt = fake_runtime(&PathBuf::from("docker"));
+        let err = verify_digest_match(
+            &rt, &app, &expected, &inspected, &mut rm, &deadline, &cancel,
+        )
+        .expect_err("wrong RepoDigest must fail");
+        match err {
+            StageExecutionError::Failed { code, .. } => assert_eq!(code, "app/digest-mismatch"),
+            other => panic!("unexpected {:?}", other),
+        }
+        // Empty RepoDigests (locally built tag) must also fail closed.
+        let empty_json = r#"[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","RepoDigests":[]}]"#;
+        let empty = parse_inspect(empty_json).expect("must parse");
+        let err2 = verify_digest_match(&rt, &app, &expected, &empty, &mut rm, &deadline, &cancel)
+            .expect_err("empty RepoDigests must fail");
+        match err2 {
+            StageExecutionError::Failed { code, .. } => assert_eq!(code, "app/digest-mismatch"),
+            other => panic!("unexpected {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn repository_less_requires_exact_id_match() {
+        let digest = "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let app = test_app(None, digest);
+        let exact_json = format!(r#"[{{"Id":"{digest}","RepoDigests":[]}}]"#);
+        let inspected = parse_inspect(&exact_json).expect("must parse");
+        let base = std::env::temp_dir().join(format!("salvage-image-exact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let run_id = salvage_core::lifecycle::RunId::new("img-exact").unwrap();
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut rm = ResourceManager::new(run_id, root);
+        let deadline = StageDeadline::new(Duration::from_secs(10), None);
+        let cancel = CancellationToken::new();
+        let rt = fake_runtime(&PathBuf::from("docker"));
+        verify_digest_match(&rt, &app, digest, &inspected, &mut rm, &deadline, &cancel)
+            .expect("exact Id must verify");
+        let prefix = InspectedImage {
+            image_id: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a00"
+                .to_owned(),
+            repo_digests: Vec::new(),
+        };
+        let err = verify_digest_match(&rt, &app, digest, &prefix, &mut rm, &deadline, &cancel)
+            .expect_err("near-miss Id must fail");
+        match err {
+            StageExecutionError::Failed { code, .. } => assert_eq!(code, "app/digest-mismatch"),
+            other => panic!("unexpected {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
