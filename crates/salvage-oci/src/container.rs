@@ -42,6 +42,10 @@ pub fn start_app_container(
         return Err(StageExecutionError::TimedOut);
     }
     let name = format!("salvage-{}", run_id.as_str());
+    // Best-effort stale cleanup: a previous leaked run with the same run-id
+    // would make `docker run --name` fail with a name conflict and leak the
+    // new attempt. `rm -f` is idempotent (missing name is success).
+    remove_stale_name(runtime, &name, resources, deadline, cancel);
     let cpus = format!("{}", limits.cpu_millicores as f64 / 1000.0);
     let memory = format!("{}m", limits.memory_mib);
     let mut args: Vec<String> = vec![
@@ -87,6 +91,24 @@ pub fn start_app_container(
         image_id: image.image_id.clone(),
         mapped_ports: mapped,
     })
+}
+
+fn remove_stale_name(
+    runtime: &ContainerRuntime,
+    name: &str,
+    resources: &mut ResourceManager,
+    deadline: &StageDeadline,
+    cancel: &CancellationToken,
+) {
+    // Ignore all outcomes: missing name is the common case, and a failing
+    // rm must not mask the subsequent `run` error.
+    let _ = run_docker_capture(
+        runtime.bin(),
+        &["rm".to_string(), "-f".to_string(), name.to_string()],
+        resources,
+        deadline,
+        cancel,
+    );
 }
 
 fn spawn_log_tail(runtime: &ContainerRuntime, id: &str, resources: &mut ResourceManager) {
