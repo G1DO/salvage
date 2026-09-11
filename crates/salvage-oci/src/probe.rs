@@ -207,7 +207,7 @@ fn check_crash(
     let exit_code =
         docker_inspect_field(runtime, container, "{{.State.ExitCode}}", deadline, cancel)
             .unwrap_or_else(|_| "unknown".to_string());
-    let logs = docker_logs_tail(runtime, container).unwrap_or_default();
+    let logs = docker_logs_tail(runtime, container, deadline, cancel).unwrap_or_default();
     let redacted = redact_logs(&logs);
     let last20: Vec<&str> = redacted
         .lines()
@@ -298,6 +298,8 @@ fn docker_inspect_field(
 fn docker_logs_tail(
     runtime: &ContainerRuntime,
     container: &ContainerHandle,
+    deadline: &StageDeadline,
+    cancel: &CancellationToken,
 ) -> Result<String, StageExecutionError> {
     let mut cmd = Command::new(runtime.bin());
     cmd.arg("logs");
@@ -315,6 +317,19 @@ fn docker_logs_tail(
     })?;
     let start = Instant::now();
     loop {
+        if cancel.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(StageExecutionError::cancelled(
+                cancel.cancellation_signal(),
+                "docker logs cancelled",
+            ));
+        }
+        if deadline.is_expired() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(StageExecutionError::TimedOut);
+        }
         match child.try_wait().map_err(|e| {
             StageExecutionError::failed(
                 "app/missing-prerequisite",

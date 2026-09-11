@@ -48,11 +48,9 @@ pub fn check_compat(
         return Err(StageExecutionError::failed(
             "app/unsupported-version",
             format!(
-                "postgres major mismatch: manifest declares {} but container reports {} ({}) Trims: {}",
+                "postgres major mismatch: manifest declares {} but container reports {}",
                 declared_major,
-                observed_major,
                 observed.trim(),
-                "see compat check"
             ),
         ));
     }

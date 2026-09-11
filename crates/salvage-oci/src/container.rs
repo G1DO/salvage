@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -253,9 +253,6 @@ fn run_docker_capture(
         }
     }
 }
-
-#[allow(dead_code)]
-fn _unused_pathbuf(_p: PathBuf) {}
 
 #[cfg(test)]
 mod tests {

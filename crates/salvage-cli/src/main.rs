@@ -302,7 +302,7 @@ fn salvage_run(opts: RunOptions) -> (i32, String) {
                 );
             }
             AnyManifest::V2(m) => {
-                let want = if let Some(pos) = flag.rfind(64 as char) {
+                let want = if let Some(pos) = flag.rfind('@') {
                     flag[pos + 1..].to_owned()
                 } else {
                     flag.clone()

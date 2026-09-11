@@ -174,3 +174,35 @@ fn run_nonexistent_manifest_reports_io_error() {
     assert!(stderr.contains(r#""status":"error""#));
     assert!(stderr.contains(r#""code":"io""#));
 }
+
+#[test]
+fn run_with_wrong_artifact_digest_fails_closed() {
+    let path = manifest_fixture("manifest-valid-v2-boot-tcp.json");
+    let output = run(&[
+        "run",
+        &path,
+        "--artifact",
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(r#""code":"app/digest-mismatch""#));
+}
+
+#[test]
+fn run_with_artifact_flag_on_v1_reports_usage() {
+    let path = manifest_fixture("manifest-valid-v1.json");
+    let output = run(&[
+        "run",
+        &path,
+        "--artifact",
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(r#""code":"usage""#));
+}
