@@ -457,7 +457,7 @@ fn redact_docker_password(text: &str) -> String {
         let flag_start = search_from + found;
         if flag_start > 0 {
             let prev = result[..flag_start].chars().next_back().unwrap();
-            if prev.is_alphanumeric() || prev == 95 as char || prev == 45 as char {
+            if prev.is_alphanumeric() || prev == '_' || prev == '-' {
                 search_from = flag_start + flag.len();
                 continue;
             }
@@ -466,7 +466,7 @@ fn redact_docker_password(text: &str) -> String {
         let rest = &result[after..];
         let trimmed = rest.trim_start();
         let mut val_start = after + (rest.len() - trimmed.len());
-        if trimmed.starts_with(61 as char) {
+        if trimmed.starts_with('=') {
             val_start += 1;
             let after_eq = &result[val_start..];
             let t2 = after_eq.trim_start();
@@ -477,14 +477,12 @@ fn redact_docker_password(text: &str) -> String {
             search_from = val_start;
             continue;
         }
-        if remaining.starts_with(45 as char) {
+        if remaining.starts_with('-') {
             search_from = val_start;
             continue;
         }
         let end = remaining
-            .find(|c: char| {
-                c.is_whitespace() || c == 44 as char || c == 59 as char || c == 38 as char
-            })
+            .find(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == '&')
             .unwrap_or(remaining.len());
         if end == 0 {
             search_from = val_start + 1;

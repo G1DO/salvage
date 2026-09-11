@@ -170,7 +170,7 @@ fn parse_major(version: &str) -> Option<u32> {
         }
         break;
     }
-    let first = version.split(46 as char).next().unwrap_or("");
+    let first = version.split('.').next().unwrap_or("");
     let digits: String = first.chars().filter(|c| c.is_ascii_digit()).collect();
     digits.parse::<u32>().ok()
 }
