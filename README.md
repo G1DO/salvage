@@ -29,7 +29,9 @@ The PostgreSQL adapter in `crates/salvage-postgres/` restores a declared logical
 
 The evidence engine in `crates/salvage-evidence/` defines the versioned (`v1`) canonical recovery evidence schema (`evidence.json`) and deterministic static report projection (`report.html`). It records run and tool identity, manifest hash, declared and observed versions, stage timings, structured events, primary verdict, and explicit completeness status (`complete` vs `incomplete`). The multi-pattern `SecretRedactor` eliminates credentials, connection strings, private keys, auth headers, and environment secrets before persistence or projection. `salvage evidence check <path>` validates an evidence bundle against supported schema versions and completeness criteria; `salvage evidence report <path>` generates a self-contained HTML report.
 
-`salvage run <path> [--backup <path>] [--expected-table <table>] [--run-id <id>] [--run-dir <dir>]` executes an end-to-end recovery run from manifest to terminal verdict against an ephemeral, isolated PostgreSQL target: exit `0` outputs a machine-readable JSON verdict confirming `verified` status and successful cleanup; exit `1` outputs a typed error verdict (`restore/digest-mismatch`, `restore/corrupt-backup`, `restore/unsupported-version`, `restore/missing-prerequisite`, `restore/structural-verification-failed`, `restore/target-connection-failed`, `timeout`, `cancelled`) while guaranteeing zero leaked child processes, temporary directories, or unix sockets; exit `2` reports unreadable input or CLI usage errors. If `--backup` is omitted, the command automatically discovers a backup file in the manifest's directory or current working directory whose SHA-256 digest matches `manifest.backup.digest`. Signal cancellation (`SIGINT`/`SIGTERM`) triggers graceful cancellation, reaps descendant process groups, cleans up scratch directories, and records a terminal `cancelled` evidence bundle.
+`salvage run <path> [--backup <path>] [--expected-table <table>] [--run-id <id>] [--run-dir <dir>]` executes an end-to-end recovery run from manifest to terminal verdict against an ephemeral, isolated PostgreSQL target. It requires executable `initdb`, `postgres`, `pg_restore`, `psql`, and `pg_isready` binaries; it checks that the discovered `pg_restore` major version matches the version declared in the manifest. Set `POSTGRES_BIN_DIR` to prioritize a PostgreSQL binary directory. Exit `0` outputs a machine-readable JSON verdict confirming `verified` status and successful cleanup. Exit `1` outputs a typed error verdict, including restore failures (`restore/digest-mismatch`, `restore/corrupt-backup`, `restore/unsupported-version`, `restore/missing-prerequisite`, `restore/structural-verification-failed`, and `restore/target-connection-failed`), timeouts, cancellations, and run-state failures. Exit `2` reports unreadable manifests or CLI usage errors.
+
+If `--backup` is omitted, the command searches the manifest directory and current working directory for a file whose SHA-256 digest matches `manifest.backup.digest`. `--expected-table` selects the table checked during structural verification (default: `salvage_records`). The run directory defaults to a per-run subdirectory of the system temporary directory, or can be selected with `--run-dir`; it contains `evidence.json`, `report.html`, `journal.jsonl`, and `state.json`. Cleanup removes the managed PostgreSQL data and socket directories and reaps managed process groups while preserving these run artifacts. Signal cancellation (`SIGINT`/`SIGTERM`) produces a terminal `cancelled` verdict and triggers that cleanup.
 
 
 ## Verification
@@ -40,7 +42,7 @@ Install `cargo-audit` once with `cargo install cargo-audit --locked`, then run t
 ./scripts/verify.sh
 ```
 
-The script checks formatting, clippy warnings, workspace tests, the locked dependency graph, and the intentional compile-fail fixture in `tests/fixtures/invalid.rs`. CI runs the same command.
+The script checks formatting, clippy warnings, workspace tests, the locked dependency graph, and the intentional compile-fail fixture in `tests/fixtures/invalid.rs`. CI runs the same command, then performs a PostgreSQL 16 black-box recovery drill and uploads its evidence bundle as an artifact.
 
 
 ## V2 boot artifact drill
@@ -55,3 +57,4 @@ Tiny drill commands:
 - Crash CMD false maps to app crash, hang sleep with boot seconds 5 maps to timed out, SIGINT mid-boot maps to cancelled
 - All runs guarantee zero leaked containers via docker ps filter and postgres directory removed
 - Evidence includes artifact digest repository resolved image and observed version plus limits boot seconds when present, report shows conditional Artifact rows and BOOT FAILED badge
+
