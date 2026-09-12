@@ -43,7 +43,7 @@ fn unsupported_command_emits_machine_readable_usage_error() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr).trim(),
-        r#"{"status":"error","code":"usage","message":"expected `salvage check | salvage manifest check <path> | salvage evidence check <path> | salvage evidence report <path> | salvage run <path> [--backup <path>]`"}"#
+        r#"{"status":"error","code":"usage","message":"expected `salvage check | salvage manifest check <path> | salvage evidence check <path> | salvage evidence report <path> | salvage run <path> [--backup <path>] [--artifact <repo@sha256:...>]`"}"#
     );
 }
 
@@ -173,4 +173,36 @@ fn run_nonexistent_manifest_reports_io_error() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(r#""status":"error""#));
     assert!(stderr.contains(r#""code":"io""#));
+}
+
+#[test]
+fn run_with_wrong_artifact_digest_fails_closed() {
+    let path = manifest_fixture("manifest-valid-v2-boot-tcp.json");
+    let output = run(&[
+        "run",
+        &path,
+        "--artifact",
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(r#""code":"app/digest-mismatch""#));
+}
+
+#[test]
+fn run_with_artifact_flag_on_v1_reports_usage() {
+    let path = manifest_fixture("manifest-valid-v1.json");
+    let output = run(&[
+        "run",
+        &path,
+        "--artifact",
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(r#""code":"usage""#));
 }

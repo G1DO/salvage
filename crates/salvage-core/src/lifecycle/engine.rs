@@ -3,12 +3,12 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::manifest::{Manifest, manifest_hash};
+use crate::manifest::{Manifest, ManifestV2, manifest_hash, manifest_hash_v2};
 
 use super::cancellation::{CancellationToken, StageDeadline};
 use super::evidence::{
     RunTelemetry, StageTimingRecord, build_evidence_bundle, persist_evidence,
-    resolve_destination_path, write_initial_incomplete_evidence,
+    resolve_destination_path,
 };
 use super::journal::{EventPayload, Journal, PersistedState, now_rfc3339};
 use super::resource::{ResourceError, ResourceManager, RunId};
@@ -96,6 +96,14 @@ pub trait StageExecutor {
         Ok(())
     }
 
+    /// Executes the application boot stage (v2 manifests only).
+    ///
+    /// The default is a no-op so existing executors keep working; Slice 2+
+    /// overrides this to boot the declared OCI artifact and probe readiness.
+    fn execute_boot(&mut self, _ctx: &mut StageContext<'_>) -> Result<(), StageExecutionError> {
+        Ok(())
+    }
+
     /// Returns captured telemetry if provided by the executor.
     fn telemetry(&self) -> Option<RunTelemetry> {
         None
@@ -107,6 +115,16 @@ pub trait StageExecutor {
 pub struct DefaultStageExecutor;
 
 impl StageExecutor for DefaultStageExecutor {}
+
+/// Boot execution policy: the engine runs its boot block if and only if a
+/// policy is present (`start_run_v2` always supplies one from
+/// `ManifestV2.deadlines.boot_seconds`; `start_run` supplies none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootPolicy {
+    /// Seconds allowed for the boot stage; must be positive (v2 manifests
+    /// guarantee this via `manifest/semantic/deadlines` validation).
+    pub boot_seconds: i64,
+}
 
 /// Configuration for running a recovery lifecycle.
 #[derive(Debug, Clone)]
@@ -204,20 +222,94 @@ impl From<std::io::Error> for RunError {
     }
 }
 
+/// Applies the declared-manifest snapshot to a freshly built bundle.
+///
+/// The snapshot is assigned *after* `build_evidence_bundle` (which redacts
+/// the core-declared value), so it must be redacted explicitly here: without
+/// this, secrets in `owner`/`destination` would leak back into evidence via
+/// the unredacted override (caught by the canary tests).
+fn apply_declared_snapshot(
+    bundle: &mut salvage_evidence::EvidenceBundle,
+    declared_manifest: &serde_json::Value,
+) {
+    bundle.manifest.declared = declared_manifest.clone();
+    let mut redactor = salvage_evidence::SecretRedactor::new();
+    redactor.add_env_secrets();
+    redactor.redact_value(&mut bundle.manifest.declared);
+}
+
 /// The engine that drives the recovery run lifecycle through its states and stages.
 pub struct RunEngine;
 
 impl RunEngine {
-    /// Executes a bounded recovery run from planning through cleanup.
+    /// Executes a bounded recovery run from planning through cleanup (v1).
+    ///
+    /// v1 manifests declare no boot stage, so the boot block never runs and
+    /// the evidence contains no `boot` timing: v1 behavior is unchanged.
     pub fn start_run(
         config: RunConfig,
         manifest: Manifest,
         executor: &mut impl StageExecutor,
     ) -> Result<RunOutcome, RunError> {
+        Self::start_run_with_boot(config, manifest, None, executor)
+    }
+
+    /// Executes a bounded run with an optional boot stage.
+    ///
+    /// `Some(boot)` runs the boot block after successful verification,
+    /// emitting `Boot` stage events and a `boot` stage timing; `None` skips
+    /// it entirely. Shared implementation behind `RunEngine::start_run`
+    /// (v1, `None`) and `RunEngine::start_run_v2` (v2, always `Some`).
+    pub fn start_run_with_boot(
+        config: RunConfig,
+        manifest: Manifest,
+        boot: Option<BootPolicy>,
+        executor: &mut impl StageExecutor,
+    ) -> Result<RunOutcome, RunError> {
+        let hash = manifest_hash(&manifest);
+        let declared = serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null);
+        Self::run_inner(config, manifest, hash, declared, boot, executor)
+    }
+
+    /// Executes a bounded recovery run for a v2 manifest (with boot stage).
+    ///
+    /// Design choice (Slice 1): `StageContext` still carries the v1 core
+    /// manifest; the v2 hash and the full declared v2 snapshot travel
+    /// alongside it into state, journal details, and evidence. Slice 2
+    /// extends the context with the full `AppArtifact`
+    /// (digest/repository/tag/readiness) so the boot executor can pull and
+    /// probe the declared artifact.
+    pub fn start_run_v2(
+        config: RunConfig,
+        manifest: ManifestV2,
+        executor: &mut impl StageExecutor,
+    ) -> Result<RunOutcome, RunError> {
+        let hash = manifest_hash_v2(&manifest);
+        let declared = serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null);
+        let boot = Some(BootPolicy {
+            boot_seconds: manifest.deadlines.boot_seconds,
+        });
+        Self::run_inner(
+            config,
+            manifest.core_manifest(),
+            hash,
+            declared,
+            boot,
+            executor,
+        )
+    }
+
+    fn run_inner(
+        config: RunConfig,
+        manifest: Manifest,
+        hash: String,
+        declared_manifest: serde_json::Value,
+        boot: Option<BootPolicy>,
+        executor: &mut impl StageExecutor,
+    ) -> Result<RunOutcome, RunError> {
         let run_id = config.run_id;
         let run_dir = config.run_dir;
         let journal = Journal::new(run_id.clone(), run_dir.clone());
-        let hash = manifest_hash(&manifest);
 
         // 1. Safe re-entry check: ensure no prior stale or completed run state exists
         if journal.state_path().exists()
@@ -277,10 +369,37 @@ impl RunEngine {
 
         let run_start_instant = Instant::now();
         let mut stage_timings: Vec<StageTimingRecord> = Vec::new();
-        let mut telemetry = RunTelemetry::default();
+        let mut telemetry = RunTelemetry {
+            boot_seconds: boot.map(|b| b.boot_seconds),
+            ..Default::default()
+        };
 
-        // Write initial incomplete evidence bundle
-        let _ = write_initial_incomplete_evidence(&run_id, &manifest, &hash, &run_dir);
+        // Write initial incomplete evidence bundle (with the declared
+        // snapshot so v2 runs reference the full v2 manifest from the start).
+        {
+            let now = now_rfc3339();
+            let stages = vec![StageTimingRecord {
+                stage: "planning".to_owned(),
+                status: "passed".to_owned(),
+                duration_ms: None,
+            }];
+            let mut initial = build_evidence_bundle(
+                &run_id,
+                &manifest,
+                &hash,
+                &now,
+                None,
+                None,
+                &stages,
+                None,
+                None,
+                Vec::new(),
+                &telemetry,
+                salvage_evidence::EvidenceCompleteness::Incomplete,
+            );
+            apply_declared_snapshot(&mut initial, &declared_manifest);
+            let _ = persist_evidence(&initial, &run_dir);
+        }
 
         stage_timings.push(StageTimingRecord {
             stage: "planning".to_owned(),
@@ -549,6 +668,97 @@ impl RunEngine {
             });
         }
 
+        // Stage 4: Boot (gated on the boot policy: v2 manifests only).
+        //
+        // v1 runs (`boot == None`) skip this block entirely: no `Boot`
+        // journal events and no `boot` timing, so v1 evidence is unchanged.
+        if let Some(boot_policy) = boot
+            && final_verdict.as_ref().is_some_and(Verdict::is_passed)
+        {
+            transition_to(
+                State::Booting,
+                &journal,
+                &mut persisted_state,
+                &mut current_state,
+            )?;
+            let boot_start = Instant::now();
+            let boot_timeout_secs = boot_policy.boot_seconds;
+            let boot_deadline = StageDeadline::new(
+                Duration::from_secs(boot_timeout_secs as u64),
+                global_deadline,
+            );
+
+            journal.record_event(EventPayload::StageStarted {
+                stage: Stage::Boot,
+                deadline_seconds: boot_timeout_secs,
+            })?;
+
+            if config.cancellation_token.is_cancelled() {
+                let sig = config.cancellation_token.cancellation_signal();
+                final_verdict = Some(Verdict::cancelled(
+                    Stage::Boot,
+                    sig,
+                    "cancelled before boot",
+                ));
+            } else if boot_deadline.is_expired() {
+                final_verdict = Some(Verdict::timed_out(Stage::Boot, boot_timeout_secs));
+            } else {
+                let mut ctx = StageContext {
+                    run_id: &run_id,
+                    manifest: &manifest,
+                    manifest_hash: &hash,
+                    resource_manager: &mut resource_manager,
+                    deadline: &boot_deadline,
+                    cancellation_token: &config.cancellation_token,
+                    journal: &journal,
+                    telemetry: &mut telemetry,
+                };
+
+                match executor.execute_boot(&mut ctx) {
+                    Ok(()) => {
+                        journal.record_event(EventPayload::StageCompleted {
+                            stage: Stage::Boot,
+                            duration_ms: boot_start.elapsed().as_millis() as u64,
+                        })?;
+                    }
+                    Err(StageExecutionError::Failed { code, message }) => {
+                        journal.record_event(EventPayload::StageFailed {
+                            stage: Stage::Boot,
+                            code: code.clone(),
+                            message: message.clone(),
+                        })?;
+                        final_verdict = Some(Verdict::failed(Stage::Boot, code, message));
+                    }
+                    Err(StageExecutionError::TimedOut) => {
+                        journal.record_event(EventPayload::StageTimedOut {
+                            stage: Stage::Boot,
+                            timeout_seconds: boot_timeout_secs,
+                        })?;
+                        final_verdict = Some(Verdict::timed_out(Stage::Boot, boot_timeout_secs));
+                    }
+                    Err(StageExecutionError::Cancelled { signal, reason }) => {
+                        journal.record_event(EventPayload::StageCancelled {
+                            stage: Stage::Boot,
+                            signal: signal.clone(),
+                            reason: reason.clone(),
+                        })?;
+                        final_verdict = Some(Verdict::cancelled(Stage::Boot, signal, reason));
+                    }
+                }
+            }
+
+            stage_timings.push(StageTimingRecord {
+                stage: "boot".to_owned(),
+                status: match &final_verdict {
+                    None | Some(Verdict::Passed) => "passed".to_owned(),
+                    Some(Verdict::Failed { .. }) => "failed".to_owned(),
+                    Some(Verdict::TimedOut { .. }) => "timed-out".to_owned(),
+                    Some(Verdict::Cancelled { .. }) => "cancelled".to_owned(),
+                },
+                duration_ms: Some(boot_start.elapsed().as_millis() as u64),
+            });
+        }
+
         let mut verdict = final_verdict.unwrap_or(Verdict::Passed);
 
         // Terminal transition
@@ -610,6 +820,24 @@ impl RunEngine {
             if telemetry.target_dbname.is_none() {
                 telemetry.target_dbname = exec_telem.target_dbname;
             }
+            if telemetry.observed_app_version.is_none() {
+                telemetry.observed_app_version = exec_telem.observed_app_version;
+            }
+            if telemetry.observed_artifact_digest.is_none() {
+                telemetry.observed_artifact_digest = exec_telem.observed_artifact_digest;
+            }
+            if telemetry.declared_artifact_digest.is_none() {
+                telemetry.declared_artifact_digest = exec_telem.declared_artifact_digest;
+            }
+            if telemetry.artifact_repository.is_none() {
+                telemetry.artifact_repository = exec_telem.artifact_repository;
+            }
+            if telemetry.artifact_resolved_image_id.is_none() {
+                telemetry.artifact_resolved_image_id = exec_telem.artifact_resolved_image_id;
+            }
+            if telemetry.boot_seconds.is_none() {
+                telemetry.boot_seconds = exec_telem.boot_seconds;
+            }
             if telemetry.verified_tables.is_empty() {
                 telemetry.verified_tables = exec_telem.verified_tables;
             }
@@ -625,7 +853,7 @@ impl RunEngine {
             .filter_map(|e| serde_json::to_value(e).ok())
             .collect();
 
-        let bundle = build_evidence_bundle(
+        let mut bundle = build_evidence_bundle(
             &run_id,
             &manifest,
             &hash,
@@ -639,6 +867,7 @@ impl RunEngine {
             &telemetry,
             salvage_evidence::EvidenceCompleteness::Complete,
         );
+        apply_declared_snapshot(&mut bundle, &declared_manifest);
 
         let mut evidence_write_error: Option<std::io::Error> = None;
 
@@ -662,7 +891,7 @@ impl RunEngine {
             });
             verdict = Verdict::failed(Stage::Verification, "evidence/write-failed", err_msg);
 
-            let updated_bundle = build_evidence_bundle(
+            let mut updated_bundle = build_evidence_bundle(
                 &run_id,
                 &manifest,
                 &hash,
@@ -676,6 +905,7 @@ impl RunEngine {
                 &telemetry,
                 salvage_evidence::EvidenceCompleteness::Complete,
             );
+            apply_declared_snapshot(&mut updated_bundle, &declared_manifest);
             let _ = persist_evidence(&updated_bundle, &run_dir);
         }
 
@@ -772,7 +1002,7 @@ impl RunEngine {
 mod tests {
 
     use super::*;
-    use crate::manifest::parse_manifest;
+    use crate::manifest::{parse_manifest, parse_manifest_v2};
 
     const VALID_MANIFEST: &str = r#"{
         "schema_version": "v1",
@@ -863,6 +1093,200 @@ mod tests {
             )
         );
         assert!(outcome.cleanup_status.is_success());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+    const VALID_V2_MANIFEST: &str = r#"{
+        "schema_version": "v2",
+        "backup": {"digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+        "postgres": {"version": "16.4"},
+        "restore": {"source": "s3", "type": "full"},
+        "app": {
+            "digest": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "tag": "v1.2.3",
+            "readiness": {"type": "tcp", "port": 8080}
+        },
+        "limits": {"cpu_millicores": 500, "memory_mib": 1024, "disk_mib": 5120},
+        "deadlines": {"restore_seconds": 600, "verify_seconds": 300, "boot_seconds": 120},
+        "evidence": {"destination": "file:///tmp/salvage-evidence"},
+        "run": {"owner": "recovery-drill"}
+    }"#;
+
+    #[test]
+    fn v2_run_executes_boot_stage_with_noop_executor() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "salvage-engine-boot-success-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let manifest = parse_manifest_v2(VALID_V2_MANIFEST).unwrap();
+        let run_id = RunId::new("test-boot-success-run").unwrap();
+        let config = RunConfig::new(run_id.clone(), temp_dir.clone());
+        let mut executor = DefaultStageExecutor;
+
+        let outcome = RunEngine::start_run_v2(config, manifest, &mut executor).unwrap();
+        assert!(outcome.verdict.is_passed());
+        assert!(outcome.cleanup_status.is_success());
+
+        let journal = Journal::new(run_id, temp_dir.clone());
+        let events = journal.load_events().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.payload,
+                EventPayload::StageStarted { stage, .. } if *stage == Stage::Boot
+            )),
+            "boot StageStarted must be journaled"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.payload,
+                EventPayload::StageCompleted { stage, .. } if *stage == Stage::Boot
+            )),
+            "boot StageCompleted must be journaled"
+        );
+
+        let evidence = std::fs::read_to_string(temp_dir.join("evidence.json")).unwrap();
+        let bundle: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        let stages = bundle["stages"].as_array().unwrap();
+        let boot = stages
+            .iter()
+            .find(|s| s["stage"] == "boot")
+            .expect("boot timing");
+        assert_eq!(boot["status"], "passed");
+        assert_eq!(bundle["manifest"]["declared"]["schema_version"], "v2");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    struct FailingBootExecutor;
+
+    impl StageExecutor for FailingBootExecutor {
+        fn execute_boot(&mut self, _ctx: &mut StageContext<'_>) -> Result<(), StageExecutionError> {
+            Err(StageExecutionError::failed(
+                "boot/readiness",
+                "readiness probe failed",
+            ))
+        }
+    }
+
+    #[test]
+    fn v2_run_maps_boot_failure_to_boot_failed_classification() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("salvage-engine-boot-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let manifest = parse_manifest_v2(VALID_V2_MANIFEST).unwrap();
+        let run_id = RunId::new("test-boot-fail-run").unwrap();
+        let config = RunConfig::new(run_id, temp_dir.clone());
+        let mut executor = FailingBootExecutor;
+
+        let outcome = RunEngine::start_run_v2(config, manifest, &mut executor).unwrap();
+        assert_eq!(
+            outcome.verdict,
+            Verdict::failed(Stage::Boot, "boot/readiness", "readiness probe failed")
+        );
+        assert!(outcome.cleanup_status.is_success());
+
+        let evidence = std::fs::read_to_string(temp_dir.join("evidence.json")).unwrap();
+        let bundle = salvage_evidence::parse_evidence_bundle(&evidence).unwrap();
+        assert_eq!(
+            bundle.verdict_classification,
+            salvage_evidence::VerdictClassification::BootFailed
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn start_run_with_boot_runs_boot_for_core_manifests() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("salvage-engine-boot-policy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let manifest = parse_manifest(VALID_MANIFEST).unwrap();
+        let run_id = RunId::new("test-boot-policy-run").unwrap();
+        let config = RunConfig::new(run_id, temp_dir.clone());
+        let mut executor = DefaultStageExecutor;
+
+        let outcome = RunEngine::start_run_with_boot(
+            config,
+            manifest,
+            Some(BootPolicy { boot_seconds: 60 }),
+            &mut executor,
+        )
+        .unwrap();
+        assert!(outcome.verdict.is_passed());
+
+        let evidence = std::fs::read_to_string(temp_dir.join("evidence.json")).unwrap();
+        let bundle: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        let stages = bundle["stages"].as_array().unwrap();
+        assert!(
+            stages
+                .iter()
+                .any(|s| s["stage"] == "boot" && s["status"] == "passed"),
+            "boot timing must be recorded when a boot policy is present"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn v1_run_records_no_boot_timing() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("salvage-engine-no-boot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let manifest = parse_manifest(VALID_MANIFEST).unwrap();
+        let run_id = RunId::new("test-no-boot-run").unwrap();
+        let config = RunConfig::new(run_id, temp_dir.clone());
+        let mut executor = DefaultStageExecutor;
+
+        let outcome = RunEngine::start_run(config, manifest, &mut executor).unwrap();
+        assert!(outcome.verdict.is_passed());
+
+        let evidence = std::fs::read_to_string(temp_dir.join("evidence.json")).unwrap();
+        let bundle: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        let stages = bundle["stages"].as_array().unwrap();
+        assert!(
+            stages.iter().all(|s| s["stage"] != "boot"),
+            "v1 evidence must not contain a boot timing"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+    #[test]
+    fn v2_run_redacts_declared_snapshot() {
+        // Regression test: the v2 declared override must be redacted exactly
+        // like the rest of the bundle (owner canary must not survive).
+        let canary = "CANARY_V2_OWNER_SECRET_31337";
+        unsafe {
+            std::env::set_var("SALVAGE_V2_OWNER_SECRET", canary);
+        }
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("salvage-engine-v2-canary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let text = VALID_V2_MANIFEST.replace(
+            r#""owner": "recovery-drill""#,
+            &format!(r#""owner": "recovery-drill-{canary}""#),
+        );
+        let manifest = parse_manifest_v2(&text).unwrap();
+        let run_id = RunId::new("test-v2-canary-run").unwrap();
+        let config = RunConfig::new(run_id, temp_dir.clone());
+        let mut executor = DefaultStageExecutor;
+
+        let outcome = RunEngine::start_run_v2(config, manifest, &mut executor).unwrap();
+        assert!(outcome.verdict.is_passed());
+
+        let evidence = std::fs::read_to_string(temp_dir.join("evidence.json")).unwrap();
+        assert!(
+            !evidence.contains(canary),
+            "v2 canary owner must not survive in evidence.json"
+        );
+        let bundle: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        assert_eq!(bundle["manifest"]["declared"]["schema_version"], "v2");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

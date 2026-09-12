@@ -4,6 +4,7 @@ members = [
     "crates/salvage-core",
     "crates/salvage-evidence",
     "crates/salvage-postgres",
+    "crates/salvage-oci",
 ]
 resolver = "2"
 
