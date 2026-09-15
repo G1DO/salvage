@@ -232,7 +232,11 @@ fn resolve_backup_path(manifest_path: &Path, expected_digest: &str) -> PathBuf {
                 {
                     let mut hasher = Sha256::new();
                     hasher.update(&file_bytes);
-                    let digest = format!("sha256:{:x}", hasher.finalize());
+                    let mut digest = String::with_capacity("sha256:".len() + 64);
+                    digest.push_str("sha256:");
+                    for byte in hasher.finalize() {
+                        digest.push_str(&format!("{byte:02x}"));
+                    }
                     if digest == expected_digest {
                         return path;
                     }
