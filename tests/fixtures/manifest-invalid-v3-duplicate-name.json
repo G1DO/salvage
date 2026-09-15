@@ -1,0 +1,64 @@
+{
+  "schema_version": "v3",
+  "backup": {
+    "digest": "sha256:f49be1627938919ee0a05a667efdf4cb90c303f9b07335814625f11bedcd2454"
+  },
+  "postgres": {
+    "version": "16.4"
+  },
+  "restore": {
+    "source": "local",
+    "type": "full"
+  },
+  "app": {
+    "digest": "sha256:e22a313ea41b0ce4bc1919997a651a41fc0ae71eaf7d605bc2cbfd03e0a32cb8",
+    "readiness": {
+      "type": "tcp",
+      "port": 8080
+    }
+  },
+  "contracts": [
+    {
+      "name": "users-count",
+      "kind": "sql",
+      "spec": {
+        "query": "SELECT count(*) FROM salvage_records"
+      },
+      "timeout_ms": 5000
+    },
+    {
+      "name": "users-count",
+      "kind": "http",
+      "spec": {
+        "url": "https://api.example.com/healthz",
+        "method": "GET"
+      },
+      "timeout_ms": 5000,
+      "egress_allow": ["api.example.com"]
+    },
+    {
+      "name": "check-db",
+      "kind": "exec",
+      "spec": {
+        "command": ["pg_isready", "-U", "postgres"]
+      },
+      "timeout_ms": 5000
+    }
+  ],
+  "limits": {
+    "cpu_millicores": 500,
+    "memory_mib": 1024,
+    "disk_mib": 5120
+  },
+  "deadlines": {
+    "restore_seconds": 60,
+    "verify_seconds": 30,
+    "boot_seconds": 60
+  },
+  "evidence": {
+    "destination": "file:///tmp/salvage-evidence"
+  },
+  "run": {
+    "owner": "recovery-drill"
+  }
+}

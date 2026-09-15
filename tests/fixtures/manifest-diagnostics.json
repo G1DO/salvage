@@ -21,5 +21,15 @@
   "manifest-invalid-v2-null-repository.json": "manifest/schema",
   "manifest-invalid-v2-bad-readiness-port.json": "manifest/semantic/app-readiness",
   "manifest-invalid-v1-with-app.json": "manifest/schema",
-  "manifest-invalid-v99-unsupported.json": "manifest/unsupported-version"
+  "manifest-invalid-v99-unsupported.json": "manifest/unsupported-version",
+  "manifest-valid-v3-contracts.json": "ok",
+  "manifest-invalid-v3-unknown-field.json": "manifest/schema",
+  "manifest-invalid-v3-bad-kind.json": "manifest/schema",
+  "manifest-invalid-v3-blank-name.json": "manifest/semantic/contract-name",
+  "manifest-invalid-v3-duplicate-name.json": "manifest/semantic/contract-duplicate",
+  "manifest-invalid-v3-zero-deadline.json": "manifest/semantic/contract-deadline",
+  "manifest-invalid-v3-oversized-deadline.json": "manifest/semantic/contract-deadline",
+  "manifest-invalid-v3-undeclared-egress.json": "manifest/semantic/contract-egress",
+  "manifest-invalid-v3-bad-spec.json": "manifest/semantic/contract-spec",
+  "manifest-invalid-v3-mutable-ref.json": "manifest/semantic/contract-mutable-ref"
 }

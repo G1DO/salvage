@@ -292,10 +292,12 @@ fn salvage_run(opts: RunOptions) -> (i32, String) {
     let backup_digest = match &any {
         AnyManifest::V1(m) => m.backup.digest.clone(),
         AnyManifest::V2(m) => m.backup.digest.clone(),
+        AnyManifest::V3(m) => m.backup.digest.clone(),
     };
     let run_owner = match &any {
         AnyManifest::V1(m) => m.run.owner.clone(),
         AnyManifest::V2(m) => m.run.owner.clone(),
+        AnyManifest::V3(m) => m.run.owner.clone(),
     };
     if let Some(ref flag) = opts.artifact {
         match &any {
@@ -306,6 +308,19 @@ fn salvage_run(opts: RunOptions) -> (i32, String) {
                 );
             }
             AnyManifest::V2(m) => {
+                let want = if let Some(pos) = flag.rfind('@') {
+                    flag[pos + 1..].to_owned()
+                } else {
+                    flag.clone()
+                };
+                if want != m.app.digest {
+                    return (
+                        1,
+                    r#"{{"status":"error","code":"app/digest-mismatch","message":"artifact digest mismatch"}}"#.to_owned(),
+                    );
+                }
+            }
+            AnyManifest::V3(m) => {
                 let want = if let Some(pos) = flag.rfind('@') {
                     flag[pos + 1..].to_owned()
                 } else {
@@ -378,6 +393,12 @@ fn salvage_run(opts: RunOptions) -> (i32, String) {
             let oci = OciBootExecutor::new(manifest_v2.app.clone(), manifest_v2.limits.clone());
             let mut combo = CompositeBootExecutor::new(pg, oci);
             RunEngine::start_run_v2(config, manifest_v2, &mut combo)
+        }
+        AnyManifest::V3(_) => {
+            return (
+                2,
+                r#"{"status":"error","code":"usage","message":"v3 contract execution is not implemented yet (O3-1 declares contracts only)"}"#.to_owned(),
+            );
         }
     };
     match outcome_res {
