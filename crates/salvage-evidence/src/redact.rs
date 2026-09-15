@@ -47,6 +47,10 @@ impl SecretRedactor {
                 || upper.contains("KEY")
                 || upper.contains("AUTH")
                 || upper.contains("CREDENTIAL")
+                || upper.contains("DOCKER")
+                || upper.contains("REGISTRY")
+                || upper.contains("GHCR")
+                || upper.contains("ECR")
             {
                 self.add_secret(val);
             }
@@ -84,7 +88,10 @@ impl SecretRedactor {
         // 6. Redact AWS access keys
         out = redact_aws_keys(&out);
 
-        // 7. Second pass for registered secrets in case regex replacements exposed them
+        // 7. Redact docker login password flag values
+        out = redact_docker_password(&out);
+
+        // 8. Second pass for registered secrets in case regex replacements exposed them
         for secret in &self.exact_secrets {
             if out.contains(secret) {
                 out = out.replace(secret, REDACTED_PLACEHOLDER);
@@ -182,6 +189,17 @@ impl SecretRedactor {
         }
         for (_, val) in bundle.telemetry.custom.iter_mut() {
             *val = self.redact_text(val);
+        }
+        if let Some(ref mut art) = bundle.artifact {
+            if let Some(ref mut repo) = art.repository {
+                *repo = self.redact_text(repo);
+            }
+            if let Some(ref mut img) = art.resolved_image_id {
+                *img = self.redact_text(img);
+            }
+            if let Some(ref mut ver) = art.observed_version {
+                *ver = self.redact_text(ver);
+            }
         }
     }
 }
@@ -426,6 +444,64 @@ fn redact_aws_keys(text: &str) -> String {
     result
 }
 
+fn redact_docker_password(text: &str) -> String {
+    let mut result = text.to_owned();
+    let flag = "--password";
+    let mut search_from = 0;
+    while search_from < result.len() {
+        let slice = &result[search_from..];
+        let found = match slice.find(flag) {
+            Some(i) => i,
+            None => break,
+        };
+        let flag_start = search_from + found;
+        if flag_start > 0 {
+            let prev = result[..flag_start].chars().next_back().unwrap();
+            if prev.is_alphanumeric() || prev == '_' || prev == '-' {
+                search_from = flag_start + flag.len();
+                continue;
+            }
+        }
+        let after = flag_start + flag.len();
+        let rest = &result[after..];
+        let trimmed = rest.trim_start();
+        let mut val_start = after + (rest.len() - trimmed.len());
+        if trimmed.starts_with('=') {
+            val_start += 1;
+            let after_eq = &result[val_start..];
+            let t2 = after_eq.trim_start();
+            val_start += after_eq.len() - t2.len();
+        }
+        let remaining = &result[val_start..];
+        if remaining.is_empty() {
+            search_from = val_start;
+            continue;
+        }
+        if remaining.starts_with('-') {
+            search_from = val_start;
+            continue;
+        }
+        let end = remaining
+            .find(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == '&')
+            .unwrap_or(remaining.len());
+        if end == 0 {
+            search_from = val_start + 1;
+            continue;
+        }
+        let val_end = val_start + end;
+        let prefix = &result[..val_start];
+        let suffix = &result[val_end..];
+        let mut new_result = String::with_capacity(result.len());
+        new_result.push_str(prefix);
+        new_result.push_str(REDACTED_PLACEHOLDER);
+        new_result.push_str(suffix);
+        let prefix_len = prefix.len();
+        result = new_result;
+        search_from = prefix_len + REDACTED_PLACEHOLDER.len();
+    }
+    result
+}
+
 fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);
@@ -477,5 +553,37 @@ mod tests {
             redactor.redact_text(text),
             "Output contains [REDACTED] within error details"
         );
+    }
+    #[test]
+    fn digests_survive_redaction() {
+        let redactor = SecretRedactor::new();
+        let digest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let out = redactor.redact_text(digest);
+        assert_eq!(out, digest);
+        let d2 = "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        assert_eq!(redactor.redact_text(d2), d2);
+    }
+
+    #[test]
+    fn redacts_docker_login_password() {
+        let redactor = SecretRedactor::new();
+        let cmd1 = "docker login --password s3cr3t registry.example.com";
+        assert!(!redactor.redact_text(cmd1).contains("s3cr3t"));
+        let cmd2 = "docker login --password=s3cr3t registry.example.com";
+        assert!(!redactor.redact_text(cmd2).contains("s3cr3t"));
+    }
+
+    #[test]
+    fn redacts_docker_env_secrets() {
+        unsafe {
+            std::env::set_var("SALVAGE_DOCKER_TOKEN_TEST_XYZ", "docker-canary-xyz-123");
+        }
+        let mut r = SecretRedactor::new();
+        r.add_env_secrets();
+        let out = r.redact_text("token docker-canary-xyz-123 here");
+        assert!(!out.contains("docker-canary-xyz-123"));
+        unsafe {
+            std::env::remove_var("SALVAGE_DOCKER_TOKEN_TEST_XYZ");
+        }
     }
 }

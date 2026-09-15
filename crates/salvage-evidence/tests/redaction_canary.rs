@@ -72,7 +72,9 @@ fn secret_canary_negative_test_fails_if_any_token_survives() {
             disk_mib: 5120,
             restore_seconds: 60,
             verify_seconds: 30,
+            boot_seconds: None,
         },
+        artifact: None,
         stages: vec![StageTimingEvidence {
             stage: "restore".to_owned(),
             status: "failed".to_owned(),
@@ -107,6 +109,8 @@ fn secret_canary_negative_test_fails_if_any_token_survives() {
         telemetry: salvage_evidence::TelemetryEvidence {
             target_dbname: Some("salvage_target".to_owned()),
             command_identity: Some(format!("pg_restore --token {}", canaries[2])),
+            observed_app_version: None,
+            observed_artifact_digest: None,
             verified_tables: vec!["users".to_owned()],
             custom: {
                 let mut m = BTreeMap::new();
