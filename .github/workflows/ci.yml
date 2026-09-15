@@ -43,6 +43,11 @@ jobs:
             --run-dir target/recovery-evidence
           ls -la target/recovery-evidence/
 
+      - name: Run Docker E2E boot tests
+        run: |
+          SALVAGE_TEST_DOCKER=1 cargo test --test e2e_boot --locked -- --ignored
+          SALVAGE_TEST_DOCKER=1 cargo test -p salvage-oci --test boot_integration --locked -- --ignored
+
       - name: Upload recovery evidence bundle
         uses: actions/upload-artifact@v4
         with:
@@ -53,4 +58,5 @@ jobs:
             target/recovery-evidence/journal.jsonl
             target/recovery-evidence/state.json
           if-no-files-found: error
+
 
