@@ -52,7 +52,11 @@ pub fn verify_backup_preflight(
     }
 
     let digest_result = hasher.finalize();
-    let computed_digest = format!("sha256:{digest_result:x}");
+    let mut computed_digest = String::with_capacity("sha256:".len() + 64);
+    computed_digest.push_str("sha256:");
+    for byte in digest_result {
+        computed_digest.push_str(&format!("{byte:02x}"));
+    }
 
     if computed_digest != expected_digest {
         return Err(StageExecutionError::failed(
