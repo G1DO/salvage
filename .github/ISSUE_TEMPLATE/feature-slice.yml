@@ -1,0 +1,53 @@
+name: Feature slice
+description: One small, independently verifiable increment of an outcome
+labels: [enhancement]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal / problem
+      description: Capability or result this slice makes true
+    validations:
+      required: true
+  - type: input
+    id: owner
+    attributes:
+      label: Owner
+      description: One accountable person
+    validations:
+      required: false
+  - type: input
+    id: outcome
+    attributes:
+      label: Parent outcome
+      description: Outcome this belongs to (Notion Outcome definition owns the full result)
+    validations:
+      required: false
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope / non-goals
+      description: In scope, deliberately out of scope, constraints (compat, perf, security)
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Behavior or success signal that defines done
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: Evidence that proves it (tests, CI, delivery/target check, evidence bundle link)
+    validations:
+      required: true
+  - type: textarea
+    id: rollout
+    attributes:
+      label: Rollout / recovery
+      description: Delivery expectations, rollback/disable/migrate path if risky
+    validations:
+      required: false
