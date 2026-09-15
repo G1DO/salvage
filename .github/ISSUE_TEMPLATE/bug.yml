@@ -1,0 +1,48 @@
+name: Bug
+description: Bounded, reproducible failure in salvage
+labels: [bug]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal / problem
+      description: What fails, expected vs actual behavior
+      placeholder: restore with manifest-valid-pg16-restore.json fails with ...
+    validations:
+      required: true
+  - type: input
+    id: owner
+    attributes:
+      label: Owner
+      description: One accountable person
+    validations:
+      required: false
+  - type: input
+    id: outcome
+    attributes:
+      label: Parent outcome
+      description: Outcome this blocks, if any. Empty for standalone fixes.
+    validations:
+      required: false
+  - type: textarea
+    id: repro
+    attributes:
+      label: Repro
+      description: Manifest fixture, CLI args, env (POSTGRES_BIN_DIR, SALVAGE_TEST_DOCKER), commit
+      placeholder: manifest..., `salvage run ...`, PG 16.4, commit sha
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Done means these hold
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: How the fix will be proven (unit/integration/E2E, evidence bundle, leak check)
+    validations:
+      required: true
