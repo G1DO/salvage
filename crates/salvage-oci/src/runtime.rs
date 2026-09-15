@@ -121,20 +121,24 @@ fn query_server_version(bin: &Path) -> Result<String, StageExecutionError> {
             )
         })? {
             Some(status) => {
-                let output = child.wait_with_output().map_err(|e| {
-                    StageExecutionError::failed(
-                        "app/missing-prerequisite",
-                        format!("failed reading docker info output: {}", e),
-                    )
-                })?;
+                let mut stdout_buf = Vec::new();
+                let mut stderr_buf = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    use std::io::Read;
+                    let _ = out.read_to_end(&mut stdout_buf);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = err.read_to_end(&mut stderr_buf);
+                }
                 if !status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stderr = String::from_utf8_lossy(&stderr_buf);
                     return Err(StageExecutionError::failed(
                         "app/missing-prerequisite",
                         format!("docker info failed: {}", stderr.trim()),
                     ));
                 }
-                let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                let version = String::from_utf8_lossy(&stdout_buf).trim().to_owned();
                 if version.is_empty() {
                     return Err(StageExecutionError::failed(
                         "app/missing-prerequisite",

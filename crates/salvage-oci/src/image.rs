@@ -294,16 +294,20 @@ fn run_docker(
             )
         })? {
             Some(status) => {
-                let output = child.wait_with_output().map_err(|e| {
-                    StageExecutionError::failed(
-                        "app/missing-prerequisite",
-                        format!("failed reading docker output: {}", e),
-                    )
-                })?;
+                let mut stdout_buf = Vec::new();
+                let mut stderr_buf = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    use std::io::Read;
+                    let _ = out.read_to_end(&mut stdout_buf);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = err.read_to_end(&mut stderr_buf);
+                }
                 return Ok(DockerOutput {
                     status_success: status.success(),
-                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                    stdout: String::from_utf8_lossy(&stdout_buf).to_string(),
+                    stderr: String::from_utf8_lossy(&stderr_buf).to_string(),
                 });
             }
             None => {

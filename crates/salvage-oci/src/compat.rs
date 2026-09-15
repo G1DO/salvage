@@ -107,20 +107,24 @@ fn exec_postgres_version(
             )
         })? {
             Some(status) => {
-                let output = child.wait_with_output().map_err(|e| {
-                    StageExecutionError::failed(
-                        "app/missing-prerequisite",
-                        format!("failed reading postgres --version: {}", e),
-                    )
-                })?;
+                let mut stdout_buf = Vec::new();
+                let mut stderr_buf = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    use std::io::Read;
+                    let _ = out.read_to_end(&mut stdout_buf);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = err.read_to_end(&mut stderr_buf);
+                }
                 if !status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stderr = String::from_utf8_lossy(&stderr_buf);
                     return Err(StageExecutionError::failed(
                         "app/unsupported-version",
                         format!("postgres --version failed: {}", stderr.trim()),
                     ));
                 }
-                return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+                return Ok(String::from_utf8_lossy(&stdout_buf).to_string());
             }
             None => {
                 std::thread::sleep(Duration::from_millis(10));
