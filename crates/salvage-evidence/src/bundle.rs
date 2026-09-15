@@ -51,6 +51,8 @@ pub enum VerdictClassification {
     Verified,
     /// Restore succeeded, but structural verification failed (Stage::Verification).
     VerificationFailed,
+    /// Verification passed, but the application boot/readiness probe failed (Stage::Boot, v2 manifests only).
+    BootFailed,
     /// Orchestration or pre-conditions failed before verification (Planning/Validation/Restore).
     OrchestrationFailed,
     /// Verification passed, but one or more owned resources failed to clean up.
@@ -68,6 +70,7 @@ impl std::fmt::Display for VerdictClassification {
         match self {
             Self::Verified => write!(f, "verified"),
             Self::VerificationFailed => write!(f, "verification-failed"),
+            Self::BootFailed => write!(f, "boot-failed"),
             Self::OrchestrationFailed => write!(f, "orchestration-failed"),
             Self::CleanupFailed => write!(f, "cleanup-failed"),
             Self::TimedOut => write!(f, "timed-out"),
@@ -141,6 +144,19 @@ pub struct VersionEvidence {
     pub observed_client: Option<String>,
 }
 
+/// Immutable OCI artifact identity observed during boot (v2 only; None on v1 runs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactEvidence {
+    pub digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_image_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_version: Option<String>,
+}
+
 /// Effective resource limits and stage deadlines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -155,6 +171,8 @@ pub struct LimitsEvidence {
     pub restore_seconds: i64,
     /// Verify stage timeout in seconds.
     pub verify_seconds: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_seconds: Option<i64>,
 }
 
 /// Timing and status of an individual execution stage.
@@ -213,6 +231,12 @@ pub struct TelemetryEvidence {
     /// Command line identity of restore tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_identity: Option<String>,
+    /// Observed application version reported by the booted artifact (v2 boot stage; additive, `None` on v1 runs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_app_version: Option<String>,
+    /// Observed OCI artifact digest of the booted application (v2 boot stage; additive, `None` on v1 runs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_artifact_digest: Option<String>,
     /// User tables structurally verified.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verified_tables: Vec<String>,
@@ -241,6 +265,8 @@ pub struct EvidenceBundle {
     pub versions: VersionEvidence,
     /// Resource and deadline limits.
     pub limits: LimitsEvidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ArtifactEvidence>,
     /// Per-stage timings.
     pub stages: Vec<StageTimingEvidence>,
     /// Primary verdict; absent if run was interrupted before terminal state.

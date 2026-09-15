@@ -42,7 +42,9 @@ fn report_projections_are_strictly_deterministic() {
             disk_mib: 5120,
             restore_seconds: 60,
             verify_seconds: 30,
+            boot_seconds: None,
         },
+        artifact: None,
         stages: vec![
             StageTimingEvidence {
                 stage: "planning".to_owned(),
@@ -87,6 +89,8 @@ fn report_projections_are_strictly_deterministic() {
         telemetry: salvage_evidence::TelemetryEvidence {
             target_dbname: Some("salvage_restore".to_owned()),
             command_identity: Some("/usr/bin/pg_restore".to_owned()),
+            observed_app_version: None,
+            observed_artifact_digest: None,
             verified_tables: vec!["users".to_owned(), "orders".to_owned()],
             custom: Default::default(),
         },

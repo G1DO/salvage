@@ -6,10 +6,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use salvage_evidence::{
-    BackupEvidence, CleanupEvidence, EvidenceBundle, EvidenceCompleteness, LimitsEvidence,
-    ManifestEvidence, RunEvidence, SUPPORTED_SCHEMA_VERSION, SecretRedactor, StageTimingEvidence,
-    TelemetryEvidence, ToolEvidence, VerdictClassification, VerdictEvidence, VersionEvidence,
-    render_html_report,
+    ArtifactEvidence, BackupEvidence, CleanupEvidence, EvidenceBundle, EvidenceCompleteness,
+    LimitsEvidence, ManifestEvidence, RunEvidence, SUPPORTED_SCHEMA_VERSION, SecretRedactor,
+    StageTimingEvidence, TelemetryEvidence, ToolEvidence, VerdictClassification, VerdictEvidence,
+    VersionEvidence, render_html_report,
 };
 
 use super::journal::now_rfc3339;
@@ -28,6 +28,18 @@ pub struct RunTelemetry {
     pub command_identity: Option<String>,
     /// Target database name.
     pub target_dbname: Option<String>,
+    /// Application version observed by the boot stage (v2 manifests only).
+    pub observed_app_version: Option<String>,
+    /// OCI artifact digest observed by the boot stage (v2 manifests only).
+    pub observed_artifact_digest: Option<String>,
+    /// Declared OCI artifact digest from v2 manifest (None on v1).
+    pub declared_artifact_digest: Option<String>,
+    /// Declared OCI repository from v2 manifest (None on v1 or repository-less).
+    pub artifact_repository: Option<String>,
+    /// Resolved image ID after ensure_image (None until boot).
+    pub artifact_resolved_image_id: Option<String>,
+    /// Declared boot deadline seconds from v2 manifest (None on v1).
+    pub boot_seconds: Option<i64>,
     /// Tables structurally verified in the target database.
     pub verified_tables: Vec<String>,
     /// Additional custom key-value telemetry.
@@ -78,7 +90,9 @@ pub fn classify_verdict(
             }
         }
         Some(Verdict::Failed { stage, .. }) => {
-            if *stage == Stage::Verification {
+            if *stage == Stage::Boot {
+                VerdictClassification::BootFailed
+            } else if *stage == Stage::Verification {
                 VerdictClassification::VerificationFailed
             } else {
                 VerdictClassification::OrchestrationFailed
@@ -88,6 +102,19 @@ pub fn classify_verdict(
         Some(Verdict::Cancelled { .. }) => VerdictClassification::Cancelled,
         None => VerdictClassification::Incomplete,
     }
+}
+
+fn build_artifact_evidence(telemetry: &RunTelemetry) -> Option<ArtifactEvidence> {
+    let digest = telemetry
+        .declared_artifact_digest
+        .clone()
+        .or_else(|| telemetry.observed_artifact_digest.clone())?;
+    Some(ArtifactEvidence {
+        digest,
+        repository: telemetry.artifact_repository.clone(),
+        resolved_image_id: telemetry.artifact_resolved_image_id.clone(),
+        observed_version: telemetry.observed_app_version.clone(),
+    })
 }
 
 /// Builds an EvidenceBundle from raw run components.
@@ -220,7 +247,9 @@ pub fn build_evidence_bundle(
             disk_mib: manifest.limits.disk_mib,
             restore_seconds: manifest.deadlines.restore_seconds,
             verify_seconds: manifest.deadlines.verify_seconds,
+            boot_seconds: telemetry.boot_seconds,
         },
+        artifact: build_artifact_evidence(telemetry),
         stages: stage_evidence,
         verdict: verdict_evidence,
         verdict_classification,
@@ -229,6 +258,8 @@ pub fn build_evidence_bundle(
         telemetry: TelemetryEvidence {
             target_dbname: telemetry.target_dbname.clone(),
             command_identity: telemetry.command_identity.clone(),
+            observed_app_version: telemetry.observed_app_version.clone(),
+            observed_artifact_digest: telemetry.observed_artifact_digest.clone(),
             verified_tables: telemetry.verified_tables.clone(),
             custom: telemetry.extra.clone(),
         },

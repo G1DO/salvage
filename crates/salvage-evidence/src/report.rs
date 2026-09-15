@@ -27,6 +27,7 @@ pub fn render_html_report(bundle: &EvidenceBundle) -> String {
     let (badge_class, badge_label) = match bundle.verdict_classification {
         VerdictClassification::Verified => ("badge-verified", "VERIFIED"),
         VerdictClassification::VerificationFailed => ("badge-failed", "VERIFICATION FAILED"),
+        VerdictClassification::BootFailed => ("badge-failed", "BOOT FAILED"),
         VerdictClassification::OrchestrationFailed => ("badge-failed", "ORCHESTRATION FAILED"),
         VerdictClassification::CleanupFailed => ("badge-warning", "CLEANUP FAILED"),
         VerdictClassification::TimedOut => ("badge-timeout", "TIMED OUT"),
@@ -172,6 +173,43 @@ pub fn render_html_report(bundle: &EvidenceBundle) -> String {
     };
 
     // Events summary count
+    let artifact_rows = if let Some(ref art) = bundle.artifact {
+        let d = escape_html(&art.digest);
+        let mut s = String::new();
+        s.push_str("<tr><th>Artifact Digest</th><td><code>");
+        s.push_str(&d);
+        s.push_str("</code></td></tr>");
+        if let Some(ref repo) = art.repository {
+            let r = escape_html(repo);
+            s.push_str("<tr><th>Artifact Repository</th><td><code>");
+            s.push_str(&r);
+            s.push_str("</code></td></tr>");
+        }
+        if let Some(ref img) = art.resolved_image_id {
+            let ii = escape_html(img);
+            s.push_str("<tr><th>Resolved Image</th><td><code>");
+            s.push_str(&ii);
+            s.push_str("</code></td></tr>");
+        }
+        if let Some(ref ov) = art.observed_version {
+            let o = escape_html(ov);
+            s.push_str("<tr><th>Observed Version</th><td><code>");
+            s.push_str(&o);
+            s.push_str("</code></td></tr>");
+        }
+        s
+    } else {
+        String::new()
+    };
+    let boot_deadline_row = if let Some(b) = bundle.limits.boot_seconds {
+        let mut s2 = String::new();
+        s2.push_str("<tr><th>Boot Deadline</th><td>");
+        s2.push_str(&b.to_string());
+        s2.push_str("s</td></tr>");
+        s2
+    } else {
+        String::new()
+    };
     let events_count = bundle.events.len();
 
     format!(
@@ -244,6 +282,7 @@ code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, mono
         <tr><th>Backup Digest</th><td><code>{backup_digest}</code></td></tr>
         <tr><th>Restore Source</th><td><code>{backup_source}</code></td></tr>
         <tr><th>Restore Type</th><td><code>{restore_type}</code></td></tr>
+{artifact_rows}
       </table>
     </div>
   </div>
@@ -269,6 +308,7 @@ code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, mono
         <tr><th>Disk Limit</th><td>{disk} MiB</td></tr>
         <tr><th>Restore Deadline</th><td>{restore_deadline}s</td></tr>
         <tr><th>Verify Deadline</th><td>{verify_deadline}s</td></tr>
+        {boot_deadline_row}
         <tr><th>Journal Events</th><td>{events_count} recorded</td></tr>
       </table>
     </div>
@@ -330,6 +370,8 @@ code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, mono
         disk = disk,
         restore_deadline = restore_deadline,
         verify_deadline = verify_deadline,
+        artifact_rows = artifact_rows,
+        boot_deadline_row = boot_deadline_row,
         events_count = events_count,
         stages_html = stages_html,
         classification_str = classification_str,
@@ -471,7 +513,9 @@ mod tests {
                 disk_mib: 5120,
                 restore_seconds: 60,
                 verify_seconds: 30,
+                boot_seconds: None,
             },
+            artifact: None,
             stages: vec![StageTimingEvidence {
                 stage: "restore".to_owned(),
                 status: "passed".to_owned(),

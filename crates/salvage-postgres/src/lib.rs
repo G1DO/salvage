@@ -61,6 +61,8 @@ pub struct PostgresStageExecutor {
     binaries: Option<PostgresBinaries>,
     /// Captured telemetry.
     pub telemetry: RestoreTelemetry,
+    /// Socket directory of the ephemeral target, if started.
+    socket_dir: Option<PathBuf>,
 }
 
 impl PostgresStageExecutor {
@@ -73,6 +75,7 @@ impl PostgresStageExecutor {
             superuser: "postgres".to_owned(),
             binaries: None,
             telemetry: RestoreTelemetry::default(),
+            socket_dir: None,
         }
     }
 
@@ -92,6 +95,11 @@ impl PostgresStageExecutor {
     pub fn with_superuser(mut self, superuser: impl Into<String>) -> Self {
         self.superuser = superuser.into();
         self
+    }
+
+    /// Returns the socket directory of the ephemeral target, if started.
+    pub fn socket_dir(&self) -> Option<&std::path::Path> {
+        self.socket_dir.as_deref()
     }
 
     /// Returns a reference to the captured stage telemetry.
@@ -138,6 +146,8 @@ impl StageExecutor for PostgresStageExecutor {
             &self.superuser,
         )?;
 
+        self.socket_dir = Some(target.socket_dir.clone());
+
         // Query server version
         let server_version = target.server_version()?;
         self.telemetry.server_version = Some(server_version.clone());
@@ -174,6 +184,12 @@ impl StageExecutor for PostgresStageExecutor {
             observed_client_version: self.telemetry.client_version.clone(),
             command_identity: self.telemetry.restore_command.clone(),
             target_dbname: self.telemetry.target_dbname.clone(),
+            observed_app_version: None,
+            observed_artifact_digest: None,
+            declared_artifact_digest: None,
+            artifact_repository: None,
+            artifact_resolved_image_id: None,
+            boot_seconds: None,
             verified_tables: self.telemetry.verified_tables.clone(),
             extra: Default::default(),
         })
