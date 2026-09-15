@@ -124,6 +124,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "salvage-oci"
+version = "0.1.0"
+dependencies = [
+ "salvage-core",
+ "salvage-postgres",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "salvage-postgres"
 version = "0.1.0"
 dependencies = [
