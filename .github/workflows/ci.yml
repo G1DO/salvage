@@ -56,7 +56,7 @@ jobs:
           SALVAGE_TEST_DOCKER=1 cargo test -p salvage-oci --test boot_integration --locked -- --ignored
 
       - name: Upload recovery evidence bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: recovery-evidence
           path: |
