@@ -65,6 +65,62 @@ pub enum ResourceKind {
         /// Process group ID.
         pgid: u32,
     },
+    /// A supervised OCI container (Slice 2).
+    Container {
+        /// Container ID or name.
+        id: String,
+        /// Container runtime binary used for removal.
+        runtime_bin: PathBuf,
+    },
+}
+
+/// Removes a container via runtime rm -f with 5s timeout.
+///
+/// Idempotent: output containing No such container (any case) is success.
+pub fn remove_container(runtime_bin: &Path, id: &str) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+    let mut child = Command::new(runtime_bin)
+        .arg("rm")
+        .arg("-f")
+        .arg(id)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn container removal: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child
+            .try_wait()
+            .map_err(|e| format!("failed waiting on container removal: {e}"))?
+        {
+            Some(status) => {
+                if status.success() {
+                    return Ok(());
+                }
+                let output = child
+                    .wait_with_output()
+                    .map_err(|e| format!("failed reading container removal output: {e}"))?;
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if combined.to_lowercase().contains("no such container") {
+                    return Ok(());
+                }
+                return Err(combined.trim().to_owned());
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("container removal timed out after 5s".to_owned());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
 }
 
 /// A system resource tagged with an explicit run ownership identity.
@@ -202,6 +258,32 @@ impl ResourceManager {
         resource_id
     }
 
+    /// Registers a supervised OCI container as owned by this run.
+    ///
+    /// Removal is via runtime rm -f during release calls (containers first).
+    /// Idempotent: re-registering the same id returns the existing ID.
+    pub fn register_container(
+        &mut self,
+        id: impl Into<String>,
+        runtime_bin: impl Into<PathBuf>,
+    ) -> String {
+        let id = id.into();
+        let resource_id = format!("container:{id}");
+        if !self.resources.iter().any(|r| r.resource_id == resource_id) {
+            self.resources.push(OwnedResource {
+                resource_id: resource_id.clone(),
+                run_id: self.run_id.clone(),
+                kind: ResourceKind::Container {
+                    id,
+                    runtime_bin: runtime_bin.into(),
+                },
+                acquired_at_rfc3339: now_rfc3339(),
+                released: false,
+            });
+        }
+        resource_id
+    }
+
     /// Releases a single resource by its ID. Idempotent.
     pub fn release_resource(&mut self, resource_id: &str) -> Result<(), ResourceError> {
         if let Some(res) = self
@@ -214,6 +296,20 @@ impl ResourceManager {
             }
 
             match &res.kind {
+                ResourceKind::Container { id, runtime_bin } => {
+                    match remove_container(runtime_bin, id) {
+                        Ok(()) => {}
+                        Err(msg) if msg.to_lowercase().contains("no such container") => {}
+                        Err(msg) => {
+                            return Err(ResourceError::Io {
+                                path: runtime_bin.clone(),
+                                source: std::io::Error::other(format!(
+                                    "failed to remove container {id}: {msg}"
+                                )),
+                            });
+                        }
+                    }
+                }
                 ResourceKind::ProcessGroup { pgid, .. } => {
                     let _ = terminate_process_group(*pgid, Duration::from_millis(100));
                 }
@@ -241,10 +337,26 @@ impl ResourceManager {
     }
 
     /// Idempotently releases and cleans up all owned resources in reverse acquisition order.
+    ///
+    /// Order: containers first, then process groups, files, directories.
     pub fn release_all(&mut self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        // 1. Terminate all process groups first
+        // 1. Remove containers first (stop app before killing log tails)
+        for res in self.resources.iter_mut().rev() {
+            if !res.released
+                && let ResourceKind::Container { id, runtime_bin } = &res.kind
+            {
+                if let Err(msg) = remove_container(runtime_bin, id)
+                    && !msg.to_lowercase().contains("no such container")
+                {
+                    errors.push(format!("failed to remove container {id}: {msg}"));
+                }
+                res.released = true;
+            }
+        }
+
+        // 2. Terminate all process groups
         for res in self.resources.iter_mut().rev() {
             if !res.released
                 && let ResourceKind::ProcessGroup { pgid, .. } = &res.kind
@@ -256,7 +368,7 @@ impl ResourceManager {
             }
         }
 
-        // 2. Remove files
+        // 3. Remove files
         for res in self.resources.iter_mut().rev() {
             if !res.released
                 && let ResourceKind::File { path } = &res.kind
@@ -270,7 +382,7 @@ impl ResourceManager {
             }
         }
 
-        // 3. Remove directories
+        // 4. Remove directories
         for res in self.resources.iter_mut().rev() {
             if !res.released
                 && let ResourceKind::Directory { path } = &res.kind
@@ -287,7 +399,7 @@ impl ResourceManager {
             }
         }
 
-        // 4. Finally remove root dir if empty or owned
+        // 5. Finally remove root dir if empty or owned
         if self.root_dir.exists()
             && let Ok(mut entries) = std::fs::read_dir(&self.root_dir)
             && entries.next().is_none()
@@ -410,5 +522,104 @@ mod tests {
         assert!(rm.acquire_directory(&outside).is_err());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn container_release_is_idempotent_on_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let base =
+            std::env::temp_dir().join(format!("salvage-container-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let fake = base.join("docker");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh
+echo Error: No such container >&2
+exit 1
+",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(remove_container(&fake, "deadbeef").is_ok());
+        let run_id = RunId::new("test-container-missing").unwrap();
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut rm = ResourceManager::new(run_id, root.clone());
+        let rid = rm.register_container("deadbeef", fake.clone());
+        assert_eq!(rid, "container:deadbeef");
+        let rid2 = rm.register_container("deadbeef", fake.clone());
+        assert_eq!(rid, rid2);
+        assert_eq!(rm.resources().len(), 1);
+        assert!(rm.release_resource(&rid).is_ok());
+        assert!(rm.release_resource(&rid).is_ok());
+        assert!(rm.release_all().is_ok());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn container_release_success_and_files_cleaned() {
+        use std::os::unix::fs::PermissionsExt;
+        let base =
+            std::env::temp_dir().join(format!("salvage-container-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let log = base.join("calls.log");
+        let fake = base.join("docker");
+        let script = format!(
+            "#!/bin/sh
+echo rm-f-called >> {}
+exit 0
+",
+            log.display()
+        );
+        std::fs::write(&fake, script).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run_id = RunId::new("test-container-ok").unwrap();
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut rm = ResourceManager::new(run_id, root.clone());
+        let scratch = rm.acquire_directory(Path::new("scratch")).unwrap();
+        let file = rm.acquire_file(Path::new("scratch/data.txt")).unwrap();
+        std::fs::write(&file, b"hello").unwrap();
+        let _cid = rm.register_container("abc123", fake.clone());
+        assert!(rm.release_all().is_ok());
+        let logged = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(logged.contains("rm-f-called"));
+        assert!(!file.exists());
+        assert!(!scratch.exists());
+        assert!(rm.release_all().is_ok());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn container_release_failure_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let base =
+            std::env::temp_dir().join(format!("salvage-container-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let fake = base.join("docker");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh
+echo daemon exploded >&2
+exit 1
+",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run_id = RunId::new("test-container-fail").unwrap();
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut rm = ResourceManager::new(run_id, root.clone());
+        let rid = rm.register_container("badid", fake.clone());
+        assert!(rm.release_resource(&rid).is_err());
+        let mut rm2 =
+            ResourceManager::new(RunId::new("test-container-fail2").unwrap(), root.clone());
+        rm2.register_container("badid2", fake.clone());
+        let err = rm2.release_all().expect_err("expected container error");
+        assert!(err.iter().any(|e| e.contains("badid2")));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
