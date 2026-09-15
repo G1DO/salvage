@@ -4,8 +4,8 @@
   "manifest-invalid-v1-unknown-field.json": "manifest/schema",
   "manifest-invalid-v1-unknown-source.json": "manifest/schema",
   "manifest-invalid-v1-null-target.json": "manifest/schema",
-  "manifest-invalid-v1-unsupported-version.json": "manifest/unsupported-version",
-  "manifest-invalid-v2-divergent.json": "manifest/unsupported-version",
+  "manifest-invalid-v1-unsupported-version.json": "manifest/schema",
+  "manifest-invalid-v2-divergent.json": "manifest/schema",
   "manifest-invalid-v1-bad-digest.json": "manifest/semantic/backup-digest",
   "manifest-invalid-v1-bad-postgres-version.json": "manifest/semantic/postgres-version",
   "manifest-invalid-v1-zero-limits.json": "manifest/semantic/limits",
@@ -13,5 +13,13 @@
   "manifest-invalid-v1-blank-destination.json": "manifest/semantic/evidence-destination",
   "manifest-invalid-v1-blank-owner.json": "manifest/semantic/run-owner",
   "manifest-invalid-v1-pitr-without-target.json": "manifest/semantic/restore-combination",
-  "manifest-invalid-v1-bad-base-digest.json": "manifest/semantic/base-backup-digest"
+  "manifest-invalid-v1-bad-base-digest.json": "manifest/semantic/base-backup-digest",
+  "manifest-valid-v2-boot-tcp.json": "ok",
+  "manifest-invalid-v2-mutable-latest.json": "manifest/semantic/app-tag",
+  "manifest-invalid-v2-bad-app-digest.json": "manifest/semantic/app-digest",
+  "manifest-invalid-v2-missing-boot-deadline.json": "manifest/schema",
+  "manifest-invalid-v2-null-repository.json": "manifest/schema",
+  "manifest-invalid-v2-bad-readiness-port.json": "manifest/semantic/app-readiness",
+  "manifest-invalid-v1-with-app.json": "manifest/schema",
+  "manifest-invalid-v99-unsupported.json": "manifest/unsupported-version"
 }
