@@ -76,6 +76,23 @@
 //! `v2` adds `manifest/semantic/app-digest`, `app-repository`, `app-tag`,
 //! and `app-readiness` diagnostics. Mutable tags (`latest`, case-insensitive,
 //! or any tag containing `@` or `:`) are rejected as `app-tag`.
+//!
+//! # Schema v3 (O3 Slice 1)
+//!
+//! `v3` is a strict superset of `v2`: every `v2` field keeps its meaning,
+//! position, and validation, and `v3` additionally requires `contracts`
+//! (declared recovery contracts without executing them). Each contract has a
+//! unique non-blank `name`, a `kind` (`sql` | `http` | `exec`), a kind-shaped
+//! `spec`, a per-contract `timeout_ms` (`1..=MAX_CONTRACT_TIMEOUT_MS`), and
+//! optional `egress_allow` (absent means deny; HTTP contracts must declare
+//! their host). The canonical v3 form orders top-level fields as
+//! `schema_version`, `backup`, `postgres`, `restore`, `app`, `contracts`,
+//! `limits`, `deadlines`, `evidence`, `run`.
+//!
+//! `v3` adds `manifest/semantic/contract-name`, `contract-duplicate`,
+//! `contract-deadline`, `contract-egress`, `contract-spec`, and
+//! `contract-mutable-ref` diagnostics. Mutable URL refs (`latest` path
+//! segment, case-insensitive) are rejected like the O2 `latest` tag rule.
 
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
@@ -85,10 +102,17 @@ use sha2::{Digest, Sha256};
 pub const SUPPORTED_SCHEMA_VERSION: &str = "v1";
 
 /// The latest schema version implemented by this crate.
-pub const LATEST_SCHEMA_VERSION: &str = "v2";
+pub const LATEST_SCHEMA_VERSION: &str = "v3";
 
 /// Every schema version this crate can read via `parse_any_manifest`.
-pub const SUPPORTED_SCHEMA_VERSIONS: [&str; 2] = [SUPPORTED_SCHEMA_VERSION, LATEST_SCHEMA_VERSION];
+pub const SUPPORTED_SCHEMA_VERSIONS: [&str; 3] =
+    [SUPPORTED_SCHEMA_VERSION, "v2", LATEST_SCHEMA_VERSION];
+
+/// Upper bound for a single contract `timeout_ms` (oversized values rejected).
+pub const MAX_CONTRACT_TIMEOUT_MS: i64 = 300_000;
+
+/// Upper bound for the number of declared contracts.
+pub const MAX_CONTRACTS: usize = 32;
 
 /// Prefix for canonical manifest hashes.
 pub const HASH_PREFIX: &str = "sha256:";
@@ -267,7 +291,7 @@ impl ManifestError {
             Self::Parse { message } | Self::Schema { message } => message.clone(),
             Self::UnsupportedVersion { found } => {
                 format!(
-                    "unsupported schema_version {found:?}; expected {SUPPORTED_SCHEMA_VERSION:?}"
+                    "unsupported schema_version {found:?}; expected one of {SUPPORTED_SCHEMA_VERSIONS:?}"
                 )
             }
             Self::Semantic { message, .. } => message.clone(),
@@ -326,6 +350,46 @@ where
     }
 
     deserializer.deserialize_option(NoNull)
+}
+
+/// Rejects explicit `null` for optional string-list fields: `None` means the
+/// key was absent, anything else (including `null`) must be a string array.
+fn deserialize_optional_string_list<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct NoNullList;
+
+    impl<'de> serde::de::Visitor<'de> for NoNullList {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an array of strings")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Err(E::custom(
+                "explicit null is not allowed; omit the field instead",
+            ))
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Err(E::custom(
+                "explicit null is not allowed; omit the field instead",
+            ))
+        }
+
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            Vec::<String>::deserialize(deserializer).map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(NoNullList)
 }
 fn is_hex_digest(text: &str) -> bool {
     text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit())
@@ -666,25 +730,29 @@ pub enum AnyManifest {
     V1(Manifest),
     /// v2 manifest with application boot artifact.
     V2(ManifestV2),
+    /// v3 manifest with application boot artifact plus declared contracts.
+    V3(ManifestV3),
 }
 
 impl AnyManifest {
-    /// Returns the declared `schema_version` (`"v1"` or `"v2"`).
+    /// Returns the declared `schema_version` (`"v1"`, `"v2"`, or `"v3"`).
     pub fn schema_version(&self) -> &str {
         match self {
             Self::V1(manifest) => manifest.schema_version.as_str(),
             Self::V2(manifest) => manifest.schema_version.as_str(),
+            Self::V3(manifest) => manifest.schema_version.as_str(),
         }
     }
 
     /// Returns the boot deadline in seconds, if declared.
     ///
     /// `None` for v1 (the engine runs no boot stage); `Some(boot_seconds)`
-    /// for v2. The lifecycle engine gates its boot block on this value.
+    /// for v2/v3. The lifecycle engine gates its boot block on this value.
     pub fn boot_seconds(&self) -> Option<i64> {
         match self {
             Self::V1(_) => None,
             Self::V2(manifest) => Some(manifest.deadlines.boot_seconds),
+            Self::V3(manifest) => Some(manifest.deadlines.boot_seconds),
         }
     }
 
@@ -693,19 +761,32 @@ impl AnyManifest {
         match self {
             Self::V1(manifest) => manifest_hash(manifest),
             Self::V2(manifest) => manifest_hash_v2(manifest),
+            Self::V3(manifest) => manifest_hash_v3(manifest),
         }
     }
 
     /// Returns the v1 core of this manifest for stage contexts.
     ///
-    /// v1 clones as-is; v2 drops `app` and narrows deadlines to
-    /// restore/verify seconds. Slice 2 extends stage contexts with the full
-    /// `AppArtifact`; until then the engine carries the core plus the v2
-    /// hash and declared snapshot.
+    /// v1 clones as-is; v2/v3 drop `app` (and `contracts`) and narrow
+    /// deadlines to restore/verify seconds. Slice 2 extends stage contexts
+    /// with the full `AppArtifact`; until then the engine carries the core
+    /// plus the versioned hash and declared snapshot.
     pub fn core_manifest(&self) -> Manifest {
         match self {
             Self::V1(manifest) => manifest.clone(),
             Self::V2(manifest) => manifest.core_manifest(),
+            Self::V3(manifest) => manifest.core_manifest(),
+        }
+    }
+
+    /// Returns the declared contracts, if any.
+    ///
+    /// `None` for v1/v2 (no contract stage); `Some(contracts)` for v3.
+    /// The contract executor (O3-2+) consumes this list.
+    pub fn contracts(&self) -> Option<&[Contract]> {
+        match self {
+            Self::V1(_) | Self::V2(_) => None,
+            Self::V3(manifest) => Some(manifest.contracts.as_slice()),
         }
     }
 }
@@ -999,7 +1080,7 @@ fn parse_manifest_v2_value(value: serde_json::Value) -> Result<ManifestV2, Manif
             });
         }
     };
-    if version != LATEST_SCHEMA_VERSION {
+    if version != "v2" {
         return Err(ManifestError::UnsupportedVersion { found: version });
     }
     let mut manifest: ManifestV2 =
@@ -1010,11 +1091,11 @@ fn parse_manifest_v2_value(value: serde_json::Value) -> Result<ManifestV2, Manif
     Ok(manifest)
 }
 
-/// Parses and validates a manifest of either supported version.
+/// Parses and validates a manifest of any supported version.
 ///
 /// Dispatches on `schema_version` before shape checks: `"v1"` parses as
-/// `Manifest`, `"v2"` as `ManifestV2`; anything else reports
-/// `manifest/unsupported-version`.
+/// `Manifest`, `"v2"` as `ManifestV2`, `"v3"` as `ManifestV3`; anything else
+/// reports `manifest/unsupported-version`.
 pub fn parse_any_manifest(text: &str) -> Result<AnyManifest, ManifestError> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|error| ManifestError::Parse {
@@ -1023,7 +1104,7 @@ pub fn parse_any_manifest(text: &str) -> Result<AnyManifest, ManifestError> {
     parse_any_manifest_value(value)
 }
 
-/// Parses and validates a manifest of either supported version from raw bytes.
+/// Parses and validates a manifest of any supported version from raw bytes.
 pub fn parse_any_manifest_bytes(bytes: &[u8]) -> Result<AnyManifest, ManifestError> {
     let text = std::str::from_utf8(bytes).map_err(|error| ManifestError::Parse {
         message: format!("invalid UTF-8: {error}"),
@@ -1042,8 +1123,10 @@ fn parse_any_manifest_value(value: serde_json::Value) -> Result<AnyManifest, Man
     };
     if version == SUPPORTED_SCHEMA_VERSION {
         parse_manifest_value(value).map(AnyManifest::V1)
-    } else if version == LATEST_SCHEMA_VERSION {
+    } else if version == "v2" {
         parse_manifest_v2_value(value).map(AnyManifest::V2)
+    } else if version == LATEST_SCHEMA_VERSION {
+        parse_manifest_v3_value(value).map(AnyManifest::V3)
     } else {
         Err(ManifestError::UnsupportedVersion { found: version })
     }
@@ -1067,12 +1150,611 @@ pub fn manifest_hash_v2(manifest: &ManifestV2) -> String {
     hex
 }
 
+// ===========================================================================
+// Schema v3: declared recovery contracts (O3 Slice 1).
+// ===========================================================================
+//
+// v3 keeps `Manifest` (v1) and `ManifestV2` (v2) frozen and adds `ManifestV3`
+// alongside them. Contracts are declared only: no executor, no isolation
+// enforcement, no evidence change here. O3-2+ builds the executor on this
+// schema. Per-contract `timeout_ms` is the deadline model (central
+// `verify_contracts_seconds` rejected: heterogeneous SQL/HTTP/exec probes
+// need per-probe budgets; see ADR 0003).
+
+/// Contract kind (v3 only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContractKind {
+    /// SQL probe with a `query` spec.
+    Sql,
+    /// HTTP probe with a `url` (+ optional `method`) spec.
+    Http,
+    /// Executable probe with a `command` spec.
+    Exec,
+}
+
+/// SQL contract spec (v3 only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SqlSpec {
+    /// SQL query text; must be non-blank.
+    pub query: String,
+}
+
+/// HTTP contract spec (v3 only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpSpec {
+    /// Absolute URL, `http://` or `https://`; must be non-blank.
+    pub url: String,
+    /// Optional HTTP method (`GET`, `POST`, ...). Explicit `null` is a
+    /// schema error, not an absent value.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub method: Option<String>,
+}
+
+/// Exec contract spec (v3 only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecSpec {
+    /// Command plus arguments; non-empty, no blank entries.
+    pub command: Vec<String>,
+}
+
+/// Kind-shaped contract spec (v3 only).
+///
+/// Untagged so the JSON stays `{kind, spec{...}}`: the `kind` field selects
+/// the expected shape and `validate_contract` cross-checks them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ContractSpec {
+    /// SQL shape: `{query}`.
+    Sql(SqlSpec),
+    /// HTTP shape: `{url, method?}`.
+    Http(HttpSpec),
+    /// Exec shape: `{command[]}`.
+    Exec(ExecSpec),
+}
+
+/// A declared recovery contract (v3 only).
+///
+/// Field order is canonical: `name`, `kind`, `spec`, `timeout_ms`,
+/// `egress_allow`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Contract {
+    /// Unique contract name; must be non-blank.
+    pub name: String,
+    /// Contract kind selecting the expected `spec` shape.
+    pub kind: ContractKind,
+    /// Kind-shaped spec.
+    pub spec: ContractSpec,
+    /// Per-contract deadline in milliseconds, `1..=MAX_CONTRACT_TIMEOUT_MS`.
+    pub timeout_ms: i64,
+    /// Optional egress allowlist. Absent means deny-all; HTTP contracts must
+    /// declare their host here. Explicit `null` is a schema error.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_string_list",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub egress_allow: Option<Vec<String>>,
+}
+
+/// A validated recovery-run manifest with boot artifact + contracts (`v3`).
+///
+/// Field order is the canonical v3 order: `schema_version`, `backup`,
+/// `postgres`, `restore`, `app`, `contracts`, `limits`, `deadlines`,
+/// `evidence`, `run`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestV3 {
+    /// Schema version; must be `"v3"`.
+    pub schema_version: String,
+    /// Immutable backup identity.
+    pub backup: Backup,
+    /// PostgreSQL version the backup belongs to.
+    pub postgres: Postgres,
+    /// Where the restore reads from and which restore kind to perform.
+    pub restore: Restore,
+    /// Immutable application artifact identity and readiness probe.
+    pub app: AppArtifact,
+    /// Declared recovery contracts (non-empty, unique names).
+    pub contracts: Vec<Contract>,
+    /// Resource limits for the isolated restore.
+    pub limits: Limits,
+    /// Per-stage deadlines in seconds (including boot).
+    pub deadlines: DeadlinesV2,
+    /// Where machine-readable evidence is written.
+    pub evidence: Evidence,
+    /// Run ownership identity.
+    pub run: Run,
+}
+
+impl ManifestV3 {
+    /// Returns the v1 core of this v3 manifest (schema `"v1"`, `app` and
+    /// `contracts` dropped, deadlines narrowed). See
+    /// `AnyManifest::core_manifest`.
+    pub fn core_manifest(&self) -> Manifest {
+        Manifest {
+            schema_version: SUPPORTED_SCHEMA_VERSION.to_owned(),
+            backup: self.backup.clone(),
+            postgres: self.postgres.clone(),
+            restore: self.restore.clone(),
+            limits: self.limits.clone(),
+            deadlines: Deadlines {
+                restore_seconds: self.deadlines.restore_seconds,
+                verify_seconds: self.deadlines.verify_seconds,
+            },
+            evidence: self.evidence.clone(),
+            run: self.run.clone(),
+        }
+    }
+}
+
+/// Allowed HTTP methods for `http` contract specs.
+const ALLOWED_HTTP_METHODS: [&str; 7] =
+    ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"];
+
+fn http_url_host(url: &str) -> Option<String> {
+    let after_scheme = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let host_port = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host_port
+        .split('@')
+        .next_back()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_owned())
+    }
+}
+
+fn egress_entry_host(entry: &str) -> String {
+    entry
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .split('@')
+        .next_back()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+fn validate_egress_allow(allow: &mut Option<Vec<String>>) -> Result<Vec<String>, ManifestError> {
+    match allow.take() {
+        None => Ok(Vec::new()),
+        Some(entries) => {
+            let mut normalized = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let trimmed = entry.trim().to_owned();
+                if trimmed.is_empty() {
+                    return Err(semantic(
+                        "manifest/semantic/contract-egress",
+                        "contracts[].egress_allow entries must be non-blank when present",
+                    ));
+                }
+                if trimmed.bytes().any(|b| b.is_ascii_whitespace()) {
+                    return Err(semantic(
+                        "manifest/semantic/contract-egress",
+                        format!(
+                            "contracts[].egress_allow entries must not contain whitespace, got {trimmed:?}"
+                        ),
+                    ));
+                }
+                if trimmed.contains("://") {
+                    return Err(semantic(
+                        "manifest/semantic/contract-egress",
+                        format!(
+                            "contracts[].egress_allow entries must be hosts, not URLs (no `://`), got {trimmed:?}"
+                        ),
+                    ));
+                }
+                normalized.push(trimmed);
+            }
+            *allow = Some(normalized.clone());
+            Ok(normalized)
+        }
+    }
+}
+
+fn validate_contract(contract: &mut Contract) -> Result<(), ManifestError> {
+    contract.name = contract.name.trim().to_owned();
+    if contract.name.is_empty() {
+        return Err(semantic(
+            "manifest/semantic/contract-name",
+            "contracts[].name must be non-blank",
+        ));
+    }
+
+    if contract.timeout_ms <= 0 || contract.timeout_ms > MAX_CONTRACT_TIMEOUT_MS {
+        return Err(semantic(
+            "manifest/semantic/contract-deadline",
+            format!(
+                "contracts[{}].timeout_ms must be 1..={MAX_CONTRACT_TIMEOUT_MS}, got {}",
+                contract.name, contract.timeout_ms
+            ),
+        ));
+    }
+
+    let egress = validate_egress_allow(&mut contract.egress_allow)?;
+
+    match (&contract.kind, &mut contract.spec) {
+        (ContractKind::Sql, ContractSpec::Sql(spec)) => {
+            spec.query = spec.query.trim().to_owned();
+            if spec.query.is_empty() {
+                return Err(semantic(
+                    "manifest/semantic/contract-spec",
+                    format!("contracts[{}].spec.query must be non-blank", contract.name),
+                ));
+            }
+        }
+        (ContractKind::Http, ContractSpec::Http(spec)) => {
+            spec.url = spec.url.trim().to_owned();
+            if spec.url.is_empty()
+                || !(spec.url.starts_with("http://") || spec.url.starts_with("https://"))
+            {
+                return Err(semantic(
+                    "manifest/semantic/contract-spec",
+                    format!(
+                        "contracts[{}].spec.url must be an `http(s)://` URL, got {:?}",
+                        contract.name, spec.url
+                    ),
+                ));
+            }
+            if spec.url.bytes().any(|b| b.is_ascii_whitespace()) {
+                return Err(semantic(
+                    "manifest/semantic/contract-spec",
+                    format!(
+                        "contracts[{}].spec.url must not contain whitespace, got {:?}",
+                        contract.name, spec.url
+                    ),
+                ));
+            }
+            let Some(host) = http_url_host(&spec.url) else {
+                return Err(semantic(
+                    "manifest/semantic/contract-spec",
+                    format!(
+                        "contracts[{}].spec.url must include a host, got {:?}",
+                        contract.name, spec.url
+                    ),
+                ));
+            };
+            // Mutable-ref rule (same policy as O2 `latest`): URL path
+            // segments pinned, never `latest`.
+            let path_start = spec.url.find("://").map(|i| i + 3).unwrap_or(0);
+            let after_host = spec.url[path_start..]
+                .find('/')
+                .map(|i| &spec.url[path_start + i..])
+                .unwrap_or("");
+            let path = after_host.split(['?', '#']).next().unwrap_or("");
+            if path
+                .split('/')
+                .any(|segment| segment.eq_ignore_ascii_case("latest"))
+            {
+                return Err(semantic(
+                    "manifest/semantic/contract-mutable-ref",
+                    format!(
+                        "contracts[{}].spec.url {:?} is mutable (`latest`); pin an immutable reference",
+                        contract.name, spec.url
+                    ),
+                ));
+            }
+            if let Some(method) = spec.method.take() {
+                let trimmed = method.trim().to_owned();
+                if trimmed.is_empty() {
+                    return Err(semantic(
+                        "manifest/semantic/contract-spec",
+                        format!(
+                            "contracts[{}].spec.method must be non-blank when present",
+                            contract.name
+                        ),
+                    ));
+                }
+                let upper = trimmed.to_ascii_uppercase();
+                if !ALLOWED_HTTP_METHODS.contains(&upper.as_str()) {
+                    return Err(semantic(
+                        "manifest/semantic/contract-spec",
+                        format!(
+                            "contracts[{}].spec.method must be one of {ALLOWED_HTTP_METHODS:?}, got {trimmed:?}",
+                            contract.name
+                        ),
+                    ));
+                }
+                spec.method = Some(upper);
+            }
+            // Default-deny egress: HTTP contracts must declare their host.
+            if egress.is_empty() {
+                return Err(semantic(
+                    "manifest/semantic/contract-egress",
+                    format!(
+                        "contracts[{}] needs egress for its HTTP host {host:?} but declares no `egress_allow` (default-deny)",
+                        contract.name
+                    ),
+                ));
+            }
+            let host_lower = host.to_ascii_lowercase();
+            if !egress
+                .iter()
+                .map(|e| egress_entry_host(e))
+                .any(|e| e == host_lower)
+            {
+                return Err(semantic(
+                    "manifest/semantic/contract-egress",
+                    format!(
+                        "contracts[{}].spec.url host {host:?} is not in `egress_allow` {egress:?} (default-deny)",
+                        contract.name
+                    ),
+                ));
+            }
+        }
+        (ContractKind::Exec, ContractSpec::Exec(spec)) => {
+            if spec.command.is_empty() {
+                return Err(semantic(
+                    "manifest/semantic/contract-spec",
+                    format!(
+                        "contracts[{}].spec.command must be non-empty",
+                        contract.name
+                    ),
+                ));
+            }
+            let mut normalized = Vec::with_capacity(spec.command.len());
+            for entry in spec.command.iter() {
+                let trimmed = entry.trim().to_owned();
+                if trimmed.is_empty() {
+                    return Err(semantic(
+                        "manifest/semantic/contract-spec",
+                        format!(
+                            "contracts[{}].spec.command entries must be non-blank",
+                            contract.name
+                        ),
+                    ));
+                }
+                normalized.push(trimmed);
+            }
+            spec.command = normalized;
+        }
+        _ => {
+            return Err(semantic(
+                "manifest/semantic/contract-spec",
+                format!(
+                    "contracts[{}].spec shape does not match kind {:?}; use query for sql, url for http, command for exec",
+                    contract.name, contract.kind
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_contracts(contracts: &mut [Contract]) -> Result<(), ManifestError> {
+    if contracts.is_empty() {
+        return Err(semantic(
+            "manifest/semantic/contract-spec",
+            "contracts must declare at least one contract",
+        ));
+    }
+    if contracts.len() > MAX_CONTRACTS {
+        return Err(semantic(
+            "manifest/semantic/contract-spec",
+            format!(
+                "contracts must declare at most {MAX_CONTRACTS} contracts, got {}",
+                contracts.len()
+            ),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for contract in contracts.iter_mut() {
+        validate_contract(contract)?;
+        if !seen.insert(contract.name.clone()) {
+            return Err(semantic(
+                "manifest/semantic/contract-duplicate",
+                format!("duplicate contract name {:?}", contract.name),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_manifest_v3(manifest: &mut ManifestV3) -> Result<(), ManifestError> {
+    // Same normalization as v1/v2: surrounding whitespace in free-text value
+    // fields is never significant. `schema_version` must match exactly.
+    manifest.backup.digest = manifest.backup.digest.trim().to_owned();
+    manifest.postgres.version = manifest.postgres.version.trim().to_owned();
+    if let Some(target) = manifest.restore.recovery_target.take() {
+        manifest.restore.recovery_target = Some(target.trim().to_owned());
+    }
+    if let Some(digest) = manifest.restore.base_backup_digest.take() {
+        manifest.restore.base_backup_digest = Some(digest.trim().to_owned());
+    }
+    manifest.evidence.destination = manifest.evidence.destination.trim().to_owned();
+    manifest.run.owner = manifest.run.owner.trim().to_owned();
+
+    validate_digest(
+        "backup.digest",
+        "manifest/semantic/backup-digest",
+        &manifest.backup.digest,
+    )?;
+    validate_postgres_version(&manifest.postgres.version)?;
+
+    match manifest.restore.restore_type {
+        RestoreType::Full => {
+            if manifest.restore.recovery_target.is_some() {
+                return Err(semantic(
+                    "manifest/semantic/restore-combination",
+                    "restore.recovery_target is only allowed with type `pitr`",
+                ));
+            }
+            if manifest.restore.base_backup_digest.is_some() {
+                return Err(semantic(
+                    "manifest/semantic/restore-combination",
+                    "restore.base_backup_digest is only allowed with type `incremental`",
+                ));
+            }
+        }
+        RestoreType::Pitr => {
+            match &manifest.restore.recovery_target {
+                Some(target) if !target.is_empty() => {}
+                _ => {
+                    return Err(semantic(
+                        "manifest/semantic/restore-combination",
+                        "restore.recovery_target is required and must be non-blank with type `pitr`",
+                    ));
+                }
+            }
+            if manifest.restore.base_backup_digest.is_some() {
+                return Err(semantic(
+                    "manifest/semantic/restore-combination",
+                    "restore.base_backup_digest is only allowed with type `incremental`",
+                ));
+            }
+        }
+        RestoreType::Incremental => {
+            match &manifest.restore.base_backup_digest {
+                Some(digest) => validate_digest(
+                    "restore.base_backup_digest",
+                    "manifest/semantic/base-backup-digest",
+                    digest,
+                )?,
+                None => {
+                    return Err(semantic(
+                        "manifest/semantic/restore-combination",
+                        "restore.base_backup_digest is required with type `incremental`",
+                    ));
+                }
+            }
+            if manifest.restore.recovery_target.is_some() {
+                return Err(semantic(
+                    "manifest/semantic/restore-combination",
+                    "restore.recovery_target is only allowed with type `pitr`",
+                ));
+            }
+        }
+    }
+
+    validate_app(&mut manifest.app)?;
+
+    validate_contracts(&mut manifest.contracts)?;
+
+    if manifest.limits.cpu_millicores <= 0
+        || manifest.limits.memory_mib <= 0
+        || manifest.limits.disk_mib <= 0
+    {
+        return Err(semantic(
+            "manifest/semantic/limits",
+            "limits.cpu_millicores, limits.memory_mib, and limits.disk_mib must all be positive",
+        ));
+    }
+
+    if manifest.deadlines.restore_seconds <= 0
+        || manifest.deadlines.verify_seconds <= 0
+        || manifest.deadlines.boot_seconds <= 0
+    {
+        return Err(semantic(
+            "manifest/semantic/deadlines",
+            "deadlines.restore_seconds, deadlines.verify_seconds, and deadlines.boot_seconds must all be positive",
+        ));
+    }
+
+    if manifest.evidence.destination.is_empty() {
+        return Err(semantic(
+            "manifest/semantic/evidence-destination",
+            "evidence.destination must be non-blank",
+        ));
+    }
+
+    if manifest.run.owner.is_empty() {
+        return Err(semantic(
+            "manifest/semantic/run-owner",
+            "run.owner must be non-blank",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Parses and validates a `v3` manifest document.
+///
+/// Same stage order as `parse_manifest`: JSON parsing, then the
+/// `schema_version` gate (`"v3"` only), then shape checks, then
+/// normalization plus semantic validation.
+pub fn parse_manifest_v3(text: &str) -> Result<ManifestV3, ManifestError> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|error| ManifestError::Parse {
+            message: format!("invalid JSON: {error}"),
+        })?;
+    parse_manifest_v3_value(value)
+}
+
+/// Parses and validates a `v3` manifest from raw bytes.
+///
+/// Undecodable bytes report `manifest/parse`, exactly like
+/// `parse_manifest_bytes`.
+pub fn parse_manifest_v3_bytes(bytes: &[u8]) -> Result<ManifestV3, ManifestError> {
+    let text = std::str::from_utf8(bytes).map_err(|error| ManifestError::Parse {
+        message: format!("invalid UTF-8: {error}"),
+    })?;
+    parse_manifest_v3(text)
+}
+
+fn parse_manifest_v3_value(value: serde_json::Value) -> Result<ManifestV3, ManifestError> {
+    let version = match value.get("schema_version") {
+        Some(serde_json::Value::String(version)) => version.clone(),
+        _ => {
+            return Err(ManifestError::Schema {
+                message: "schema violation: missing or non-string `schema_version`".to_owned(),
+            });
+        }
+    };
+    if version != LATEST_SCHEMA_VERSION {
+        return Err(ManifestError::UnsupportedVersion { found: version });
+    }
+    let mut manifest: ManifestV3 =
+        serde_json::from_value(value).map_err(|error| ManifestError::Schema {
+            message: format!("schema violation: {error}"),
+        })?;
+    validate_manifest_v3(&mut manifest)?;
+    Ok(manifest)
+}
+
+/// Serializes the v3 manifest in canonical form (compact JSON, declaration
+/// field order, no trailing newline).
+pub fn normalized_json_v3(manifest: &ManifestV3) -> String {
+    serde_json::to_string(manifest).expect("manifest serialization is infallible")
+}
+
+/// Returns the canonical content hash identifying the exact effective v3
+/// manifest: `sha256:<hex>` over `normalized_json_v3` bytes.
+pub fn manifest_hash_v3(manifest: &ManifestV3) -> String {
+    let digest = Sha256::digest(normalized_json_v3(manifest).as_bytes());
+    let mut hex = String::with_capacity(HASH_PREFIX.len() + 64);
+    hex.push_str(HASH_PREFIX);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AnyManifest, AppReadiness, ManifestError, manifest_hash, manifest_hash_v2, normalized_json,
-        normalized_json_v2, parse_any_manifest, parse_manifest, parse_manifest_bytes,
-        parse_manifest_v2,
+        AnyManifest, AppReadiness, ManifestError, manifest_hash, manifest_hash_v2,
+        manifest_hash_v3, normalized_json, normalized_json_v2, normalized_json_v3,
+        parse_any_manifest, parse_manifest, parse_manifest_bytes, parse_manifest_v2,
+        parse_manifest_v3,
     };
 
     const VALID: &str = r#"{
@@ -1398,5 +2080,146 @@ mod tests {
         let normalized = parse_manifest_v2(&padded).expect("padded");
         assert_eq!(normalized_json_v2(&base), normalized_json_v2(&normalized));
         assert_eq!(manifest_hash_v2(&base), manifest_hash_v2(&normalized));
+    }
+
+    const VALID_V3: &str = r#"{
+        "schema_version": "v3",
+        "backup": {"digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+        "postgres": {"version": "16.4"},
+        "restore": {"source": "s3", "type": "full"},
+        "app": {
+            "digest": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "repository": "registry.example.com/team/app",
+            "tag": "v1.2.3",
+            "readiness": {"type": "tcp", "port": 8080}
+        },
+        "contracts": [
+            {"name": "users-count", "kind": "sql", "spec": {"query": "SELECT count(*) FROM salvage_records"}, "timeout_ms": 5000},
+            {"name": "health", "kind": "http", "spec": {"url": "https://api.example.com/healthz", "method": "GET"}, "timeout_ms": 5000, "egress_allow": ["api.example.com"]},
+            {"name": "check-db", "kind": "exec", "spec": {"command": ["pg_isready", "-U", "postgres"]}, "timeout_ms": 5000}
+        ],
+        "limits": {"cpu_millicores": 500, "memory_mib": 1024, "disk_mib": 5120},
+        "deadlines": {"restore_seconds": 600, "verify_seconds": 300, "boot_seconds": 120},
+        "evidence": {"destination": "file:///tmp/salvage-evidence"},
+        "run": {"owner": "recovery-drill"}
+    }"#;
+
+    #[test]
+    fn accepts_a_valid_v3_manifest() {
+        let manifest = parse_manifest_v3(VALID_V3).expect("valid v3 manifest must parse");
+        assert_eq!(manifest.schema_version, "v3");
+        assert_eq!(manifest.contracts.len(), 3);
+        assert!(manifest_hash_v3(&manifest).starts_with("sha256:"));
+    }
+
+    #[test]
+    fn v3_canonical_form_orders_contracts_after_app() {
+        let manifest = parse_manifest_v3(VALID_V3).expect("valid");
+        let canonical = normalized_json_v3(&manifest);
+        assert!(
+            canonical.starts_with(r#"{"schema_version":"v3","backup":"#),
+            "v3 canonical form must keep declaration order"
+        );
+        let app_pos = canonical.find(r#""app":"#).expect("app present");
+        let contracts_pos = canonical
+            .find(r#""contracts":"#)
+            .expect("contracts present");
+        let limits_pos = canonical.find(r#""limits":"#).expect("limits present");
+        assert!(app_pos < contracts_pos && contracts_pos < limits_pos);
+    }
+
+    #[test]
+    fn v3_rejects_contract_matrix() {
+        // Unknown fields.
+        let text = VALID_V3.replace(
+            r#""run": {"owner": "recovery-drill"}"#,
+            r#""run": {"owner": "recovery-drill"}, "scripts": ["echo hi"]"#,
+        );
+        assert_eq!(
+            parse_manifest_v3(&text).expect_err("unknown field").code(),
+            "manifest/schema"
+        );
+        // Blank names.
+        let text = VALID_V3.replace(r#""name": "users-count""#, r#""name": "  ""#);
+        assert_eq!(
+            parse_manifest_v3(&text).expect_err("blank name").code(),
+            "manifest/semantic/contract-name"
+        );
+        // Duplicate names.
+        let text = VALID_V3.replace(r#""name": "health""#, r#""name": "users-count""#);
+        assert_eq!(
+            parse_manifest_v3(&text).expect_err("duplicate").code(),
+            "manifest/semantic/contract-duplicate"
+        );
+        // Zero deadlines.
+        let text = VALID_V3.replace(r#""timeout_ms": 5000"#, r#""timeout_ms": 0"#);
+        assert_eq!(
+            parse_manifest_v3(&text).expect_err("zero deadline").code(),
+            "manifest/semantic/contract-deadline"
+        );
+        // Oversized deadlines.
+        let text = VALID_V3.replace(r#""timeout_ms": 5000"#, r#""timeout_ms": 300001"#);
+        assert_eq!(
+            parse_manifest_v3(&text).expect_err("oversized").code(),
+            "manifest/semantic/contract-deadline"
+        );
+        // Undeclared egress: HTTP without `egress_allow`.
+        let text = VALID_V3.replace(r#", "egress_allow": ["api.example.com"]"#, "");
+        assert_eq!(
+            parse_manifest_v3(&text).expect_err("egress").code(),
+            "manifest/semantic/contract-egress"
+        );
+        // Mutable refs: `latest` URL segment.
+        let text = VALID_V3.replace(
+            "https://api.example.com/healthz",
+            "https://api.example.com/latest",
+        );
+        assert_eq!(
+            parse_manifest_v3(&text).expect_err("mutable ref").code(),
+            "manifest/semantic/contract-mutable-ref"
+        );
+        // Kind/spec mismatch: sql kind with an http-shaped spec.
+        let text = VALID_V3.replace(
+            r#"{"query": "SELECT count(*) FROM salvage_records"}"#,
+            r#"{"url": "https://api.example.com/healthz"}"#,
+        );
+        assert_eq!(
+            parse_manifest_v3(&text).expect_err("mismatch").code(),
+            "manifest/semantic/contract-spec"
+        );
+    }
+
+    #[test]
+    fn v3_rejects_mutable_app_tag_like_v2() {
+        let text = VALID_V3.replace(r#""tag": "v1.2.3""#, r#""tag": "latest""#);
+        assert_eq!(
+            parse_manifest_v3(&text).expect_err("latest tag").code(),
+            "manifest/semantic/app-tag"
+        );
+    }
+
+    #[test]
+    fn any_manifest_dispatches_all_versions() {
+        assert!(matches!(
+            parse_any_manifest(VALID_V3).expect("v3"),
+            AnyManifest::V3(_)
+        ));
+        let any = parse_any_manifest(VALID_V3).expect("v3");
+        assert_eq!(any.schema_version(), "v3");
+        assert_eq!(any.boot_seconds(), Some(120));
+        assert!(any.manifest_hash_any().starts_with("sha256:"));
+        assert_eq!(any.contracts().expect("contracts").len(), 3);
+        assert!(parse_any_manifest(VALID).expect("v1").contracts().is_none());
+        // v1/v2 entry points still reject v3 documents.
+        assert_eq!(
+            parse_manifest(VALID_V3).expect_err("v1 rejects v3").code(),
+            "manifest/unsupported-version"
+        );
+        assert_eq!(
+            parse_manifest_v2(VALID_V3)
+                .expect_err("v2 rejects v3")
+                .code(),
+            "manifest/unsupported-version"
+        );
     }
 }
