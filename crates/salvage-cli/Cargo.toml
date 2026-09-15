@@ -12,6 +12,7 @@ path = "src/main.rs"
 salvage-core = { path = "../salvage-core" }
 salvage-evidence = { path = "../salvage-evidence" }
 salvage-postgres = { path = "../salvage-postgres" }
+salvage-oci = { path = "../salvage-oci" }
 sha2 = "0.10"
 
 [dev-dependencies]

@@ -3,13 +3,14 @@ use std::path::{Path, PathBuf};
 use salvage_core::lifecycle::{
     RunConfig, RunEngine, RunError, RunId, Verdict, install_signal_handler,
 };
-use salvage_core::manifest::{SUPPORTED_SCHEMA_VERSION, manifest_hash, parse_manifest_bytes};
+use salvage_core::manifest::{AnyManifest, parse_any_manifest_bytes};
 use salvage_core::workspace_check;
 use salvage_evidence::{EvidenceCompleteness, parse_evidence_bundle_bytes, render_html_report};
+use salvage_oci::{CompositeBootExecutor, OciBootExecutor};
 use salvage_postgres::PostgresStageExecutor;
 use sha2::{Digest, Sha256};
 
-const USAGE: &str = "salvage check | salvage manifest check <path> | salvage evidence check <path> | salvage evidence report <path> | salvage run <path> [--backup <path>]";
+const USAGE: &str = "salvage check | salvage manifest check <path> | salvage evidence check <path> | salvage evidence report <path> | salvage run <path> [--backup <path>] [--artifact <repo@sha256:...>]";
 
 fn json_escape(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
@@ -41,12 +42,13 @@ fn manifest_check(path: &str) -> (i32, String) {
             );
         }
     };
-    match parse_manifest_bytes(&bytes) {
-        Ok(manifest) => (
+    match parse_any_manifest_bytes(&bytes) {
+        Ok(any) => (
             0,
             format!(
-                r#"{{"status":"ok","command":"manifest-check","schema_version":"{SUPPORTED_SCHEMA_VERSION}","manifest_hash":"{}"}}"#,
-                manifest_hash(&manifest)
+                r#"{{"status":"ok","command":"manifest-check","schema_version":"{}","manifest_hash":"{}"}}"#,
+                any.schema_version(),
+                any.manifest_hash_any()
             ),
         ),
         Err(error) => (
@@ -139,6 +141,7 @@ struct RunOptions {
     run_id: Option<String>,
     run_dir: Option<String>,
     expected_table: Option<String>,
+    artifact: Option<String>,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
@@ -155,6 +158,7 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
     let mut run_id = None;
     let mut run_dir = None;
     let mut expected_table = None;
+    let mut artifact = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -187,6 +191,13 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
                 }
                 expected_table = Some(args[i].clone());
             }
+            "--artifact" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("expected digest after --artifact".to_owned());
+                }
+                artifact = Some(args[i].clone());
+            }
             arg if !arg.starts_with('-') && backup_path.is_none() => {
                 backup_path = Some(arg.to_owned());
             }
@@ -203,6 +214,7 @@ fn parse_run_args(args: &[String]) -> Result<RunOptions, String> {
         run_id,
         run_dir,
         expected_table,
+        artifact,
     })
 }
 
@@ -257,8 +269,8 @@ fn salvage_run(opts: RunOptions) -> (i32, String) {
         }
     };
 
-    let manifest = match parse_manifest_bytes(&bytes) {
-        Ok(manifest) => manifest,
+    let any = match parse_any_manifest_bytes(&bytes) {
+        Ok(any) => any,
         Err(error) => {
             return (
                 1,
@@ -271,11 +283,43 @@ fn salvage_run(opts: RunOptions) -> (i32, String) {
         }
     };
 
-    let manifest_hash_val = manifest_hash(&manifest);
+    let schema_version = any.schema_version().to_owned();
+    let manifest_hash_val = any.manifest_hash_any();
+    let backup_digest = match &any {
+        AnyManifest::V1(m) => m.backup.digest.clone(),
+        AnyManifest::V2(m) => m.backup.digest.clone(),
+    };
+    let run_owner = match &any {
+        AnyManifest::V1(m) => m.run.owner.clone(),
+        AnyManifest::V2(m) => m.run.owner.clone(),
+    };
+    if let Some(ref flag) = opts.artifact {
+        match &any {
+            AnyManifest::V1(_) => {
+                return (
+                    2,
+                    r#"{{"status":"error","code":"usage","message":"artifact flag requires v2 manifest"}}"#.to_owned(),
+                );
+            }
+            AnyManifest::V2(m) => {
+                let want = if let Some(pos) = flag.rfind('@') {
+                    flag[pos + 1..].to_owned()
+                } else {
+                    flag.clone()
+                };
+                if want != m.app.digest {
+                    return (
+                        1,
+                    r#"{{"status":"error","code":"app/digest-mismatch","message":"artifact digest mismatch"}}"#.to_owned(),
+                    );
+                }
+            }
+        }
+    }
 
     let backup_path = match opts.backup_path {
         Some(path) => PathBuf::from(path),
-        None => resolve_backup_path(Path::new(&opts.manifest_path), &manifest.backup.digest),
+        None => resolve_backup_path(Path::new(&opts.manifest_path), &backup_digest),
     };
 
     let run_id = match opts.run_id {
@@ -296,7 +340,7 @@ fn salvage_run(opts: RunOptions) -> (i32, String) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            RunId::new(format!("{}-{nanos}", manifest.run.owner)).unwrap()
+            RunId::new(format!("{}-{nanos}", run_owner)).unwrap()
         }
     };
 
@@ -315,21 +359,32 @@ fn salvage_run(opts: RunOptions) -> (i32, String) {
     };
 
     let config = RunConfig::new(run_id.clone(), run_dir);
-    let mut executor = PostgresStageExecutor::new(backup_path);
-    if let Some(table) = opts.expected_table {
-        executor = executor.with_expected_table(table);
-    } else {
-        executor = executor.with_expected_table("salvage_records");
-    }
-
-    match RunEngine::start_run(config, manifest, &mut executor) {
+    let expected_name = opts
+        .expected_table
+        .clone()
+        .unwrap_or_else(|| "salvage_records".to_owned());
+    let outcome_res = match any {
+        AnyManifest::V1(manifest) => {
+            let mut executor = PostgresStageExecutor::new(backup_path);
+            executor = executor.with_expected_table(expected_name);
+            RunEngine::start_run(config, manifest, &mut executor)
+        }
+        AnyManifest::V2(manifest_v2) => {
+            let pg = PostgresStageExecutor::new(backup_path).with_expected_table(expected_name);
+            let oci = OciBootExecutor::new(manifest_v2.app.clone(), manifest_v2.limits.clone());
+            let mut combo = CompositeBootExecutor::new(pg, oci);
+            RunEngine::start_run_v2(config, manifest_v2, &mut combo)
+        }
+    };
+    match outcome_res {
         Ok(outcome) => {
             if outcome.verdict.is_passed() && outcome.cleanup_status.is_success() {
                 (
                     0,
                     format!(
-                        r#"{{"status":"ok","command":"run","run_id":"{}","schema_version":"{SUPPORTED_SCHEMA_VERSION}","manifest_hash":"{}","verdict":"passed","verdict_classification":"verified","cleanup_status":"success"}}"#,
+                        r#"{{"status":"ok","command":"run","run_id":"{}","schema_version":"{}","manifest_hash":"{}","verdict":"passed","verdict_classification":"verified","cleanup_status":"success"}}"#,
                         json_escape(run_id.as_str()),
+                        json_escape(&schema_version),
                         manifest_hash_val,
                     ),
                 )
