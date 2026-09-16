@@ -32,6 +32,35 @@ docker ps --filter 'name=salvage' --filter 'ancestor=salvage-tiny-http' -q | wc 
 # expect 0; postgres data/socket dirs removed, evidence preserved
 ```
 
+## v3 contracts drill (O3-5)
+
+```sh
+# E2E matrix (opt-in Docker, ignored by default):
+SALVAGE_TEST_DOCKER=1 cargo test --test e2e_contracts --locked -- --ignored
+# happy: PG16 dump + tiny-http + SQL + local-HTTP + exec => verified
+# egress: prod-forbidden.invalid blocked, allowed:false, network cleaned
+# hang/crash: contract/timeout + contract/crash => verification-failed, no leak
+# canary: secret in SQL/HTTP/exec output => [REDACTED], never raw
+
+# manual v3 drill (fixture uses local http://127.0.0.1:8000/, digest placeholder):
+docker build -t salvage-tiny-http:test tests/fixtures/images/tiny-http
+DIGEST=$(docker image inspect salvage-tiny-http:test --format '{{.Id}}')
+sed "s/e22a313ea41b0ce4bc1919997a651a41fc0ae71eaf7d605bc2cbfd03e0a32cb8/${DIGEST#sha256:}/" \
+  tests/fixtures/manifest-valid-v3-e2e.json > /tmp/manifest-v3-e2e.json
+python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
+HTTP_PID=$!
+cargo run -p salvage-cli --locked -- run /tmp/manifest-v3-e2e.json \
+  --backup tests/fixtures/valid-pg16-custom.dump \
+  --run-dir target/recovery-evidence-v3
+kill $HTTP_PID
+ls -la target/recovery-evidence-v3/
+# expect evidence.json (contracts[] all passed + isolation allowed:false),
+# report.html (Recovery Contracts + Boot Isolation), journal.jsonl, state.json
+salvage evidence check target/recovery-evidence-v3/evidence.json
+```
+
+Contracts are versioned: `sql` socket-only `psql`, `http` `http://` only (`https` → `contract/crash`), `exec` no-shell allowlist (`echo,sleep,false,pg_isready,psql,cat`). Per-contract `timeout_ms` `1..=300000`, output 64 KiB / rows 1000. Health-alone-cannot-verify: boot green + contracts fail ⇒ `verification-failed`, never `verified`.
+
 ## Leak / cleanup check
 
 - `docker ps` filtered by run: must be empty after every verdict (verified, failed, timed-out, cancelled).
