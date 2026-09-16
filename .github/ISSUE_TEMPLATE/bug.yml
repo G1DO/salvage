@@ -11,13 +11,6 @@ body:
     validations:
       required: true
   - type: input
-    id: owner
-    attributes:
-      label: Owner
-      description: One accountable person
-    validations:
-      required: false
-  - type: input
     id: outcome
     attributes:
       label: Parent outcome
