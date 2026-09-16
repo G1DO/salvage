@@ -80,6 +80,8 @@ fn secret_canary_negative_test_fails_if_any_token_survives() {
             status: "failed".to_owned(),
             duration_ms: Some(500),
         }],
+        contracts: None,
+        isolation: None,
         verdict: Some(VerdictEvidence {
             verdict: "failed".to_owned(),
             stage: Some("restore".to_owned()),

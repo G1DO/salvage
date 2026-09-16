@@ -13,10 +13,13 @@
 //! - `run.total_duration_ms`: total wall-clock duration of the run
 //! - `stages[*].duration_ms`: elapsed duration for each stage execution
 //! - `events[*].timestamp_rfc3339`, `events[*].run_id`, `events[*].duration_ms`: event timestamps, run identifiers, and stage elapsed timings
+//! - `contracts[*].duration_ms`: wall-clock time per contract execution
 //!
 //! All other fields (manifest hash, declared config, observed versions, verdicts,
-//! classifications, cleanup status, verified tables, and stage transition sequences)
-//! are strictly deterministic.
+//! classifications, cleanup status, verified tables, contract outputs/codes, and
+//! stage transition sequences) are strictly deterministic. Contract `output` is
+//! redacted and cap-truncated before persist, so it is deterministic for fixed
+//! inputs.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -48,11 +51,18 @@ impl std::fmt::Display for EvidenceCompleteness {
 #[serde(rename_all = "kebab-case")]
 pub enum VerdictClassification {
     /// All stages and structural verification passed, and resource cleanup succeeded.
+    /// For v3 runs this additionally requires contracts non-empty and all passed;
+    /// see `classify` contract gating (O3-4, ADR 0005).
     Verified,
     /// Restore succeeded, but structural verification failed (Stage::Verification).
+    /// Contract failures (`contract/...`) also map here.
     VerificationFailed,
     /// Verification passed, but the application boot/readiness probe failed (Stage::Boot, v2 manifests only).
     BootFailed,
+    /// Boot isolation was violated or the isolation policy could not be applied
+    /// (`isolation/egress-allowed`, `isolation/policy-failed`). Never `Verified`.
+    /// See ADR 0005.
+    IsolationFailed,
     /// Orchestration or pre-conditions failed before verification (Planning/Validation/Restore).
     OrchestrationFailed,
     /// Verification passed, but one or more owned resources failed to clean up.
@@ -71,6 +81,7 @@ impl std::fmt::Display for VerdictClassification {
             Self::Verified => write!(f, "verified"),
             Self::VerificationFailed => write!(f, "verification-failed"),
             Self::BootFailed => write!(f, "boot-failed"),
+            Self::IsolationFailed => write!(f, "isolation-failed"),
             Self::OrchestrationFailed => write!(f, "orchestration-failed"),
             Self::CleanupFailed => write!(f, "cleanup-failed"),
             Self::TimedOut => write!(f, "timed-out"),
@@ -221,6 +232,66 @@ pub struct CleanupEvidence {
     pub errors: Vec<String>,
 }
 
+/// Per-contract execution result recorded in evidence (O3-4, additive).
+///
+/// `output` is redacted via `SecretRedactor` and cap-truncated before persist,
+/// so it is safe to retain. `duration_ms` is runtime-dependent and excluded
+/// from golden comparisons (like `stages[].duration_ms`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContractEvidence {
+    /// Declared contract name.
+    pub name: String,
+    /// Contract kind (`sql` | `http` | `exec`).
+    pub kind: String,
+    /// Outcome status (`passed` | `failed` | `timed-out`).
+    pub status: String,
+    /// Stable classification code (`contract/*`) when not passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// Redacted, cap-truncated captured output.
+    #[serde(default)]
+    pub output: String,
+    /// True when `output` was cut to fit caps.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Wall-clock execution time in milliseconds (non-deterministic).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Row count for `sql` contracts; otherwise 0.
+    #[serde(default)]
+    pub rows: usize,
+}
+
+/// Forbidden-egress probe outcome recorded in evidence (O3-4, additive).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressEvidence {
+    /// Forbidden host that was attempted (e.g. `prod-forbidden.invalid`).
+    pub host: String,
+    /// Always `false` on success (blocked). Reachable is a verdict failure,
+    /// never `true` in persisted evidence.
+    pub allowed: bool,
+    /// Redacted probe detail (safe for evidence).
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// Boot isolation block recorded in evidence (O3-4, additive).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IsolationEvidence {
+    /// Per-run isolated network name (`salvage-net-<run-id>`), if created.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// Validated egress allowlist union from `contracts[].egress_allow`
+    /// (still denied in O3-3/O3-4; retained for evidence and future proxy).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowlist: Vec<String>,
+    /// Forbidden-egress probe result.
+    pub egress: EgressEvidence,
+}
+
 /// Operational telemetry recorded by the restore adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -269,6 +340,15 @@ pub struct EvidenceBundle {
     pub artifact: Option<ArtifactEvidence>,
     /// Per-stage timings.
     pub stages: Vec<StageTimingEvidence>,
+    /// App-owned contract results (O3-4, additive; `None` on v1/v2 runs,
+    /// `Some` on v3 runs). `None` preserves v1 reader compat and legacy
+    /// `Verified` semantics; `Some` requires non-empty all-passed for
+    /// `Verified` (see ADR 0005).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contracts: Option<Vec<ContractEvidence>>,
+    /// Boot isolation block (O3-4, additive; `None` when isolation did not run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<IsolationEvidence>,
     /// Primary verdict; absent if run was interrupted before terminal state.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict: Option<VerdictEvidence>,
@@ -327,6 +407,28 @@ impl EvidenceBundle {
                 return Err(EvidenceError::Incomplete {
                     message: "complete bundle cannot have incomplete classification".to_owned(),
                 });
+            }
+            // O3-4: a `Verified` bundle with a contracts block must prove it:
+            // non-empty and all passed. `None` is legacy v1/v2 (no contracts
+            // stage) and stays valid. `Some` with empty/failed contracts can
+            // never verify; `evidence check` rejects such bundles.
+            if self.verdict_classification == VerdictClassification::Verified
+                && let Some(contracts) = self.contracts.as_ref()
+            {
+                if contracts.is_empty() {
+                    return Err(EvidenceError::Incomplete {
+                        message: "verified bundle must contain non-empty contracts[] results"
+                            .to_owned(),
+                    });
+                }
+                if contracts
+                    .iter()
+                    .any(|c| c.status != "passed" || c.code.is_some())
+                {
+                    return Err(EvidenceError::Incomplete {
+                        message: "verified bundle must have all contracts passed".to_owned(),
+                    });
+                }
             }
         }
 

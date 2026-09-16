@@ -74,6 +74,8 @@ impl StageExecutor for MockTelemetryExecutor {
             artifact_repository: None,
             artifact_resolved_image_id: None,
             boot_seconds: None,
+            contracts: None,
+            isolation: None,
             verified_tables: self.verified_tables.clone(),
             extra: Default::default(),
         })

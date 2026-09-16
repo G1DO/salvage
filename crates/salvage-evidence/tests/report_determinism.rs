@@ -72,6 +72,8 @@ fn report_projections_are_strictly_deterministic() {
                 duration_ms: Some(70),
             },
         ],
+        contracts: None,
+        isolation: None,
         verdict: Some(VerdictEvidence {
             verdict: "passed".to_owned(),
             stage: None,

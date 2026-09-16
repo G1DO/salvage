@@ -6,10 +6,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use salvage_evidence::{
-    ArtifactEvidence, BackupEvidence, CleanupEvidence, EvidenceBundle, EvidenceCompleteness,
-    LimitsEvidence, ManifestEvidence, RunEvidence, SUPPORTED_SCHEMA_VERSION, SecretRedactor,
-    StageTimingEvidence, TelemetryEvidence, ToolEvidence, VerdictClassification, VerdictEvidence,
-    VersionEvidence, render_html_report,
+    ArtifactEvidence, BackupEvidence, CleanupEvidence, ContractEvidence, EvidenceBundle,
+    EvidenceCompleteness, IsolationEvidence, LimitsEvidence, ManifestEvidence, RunEvidence,
+    SUPPORTED_SCHEMA_VERSION, SecretRedactor, StageTimingEvidence, TelemetryEvidence, ToolEvidence,
+    VerdictClassification, VerdictEvidence, VersionEvidence, render_html_report,
 };
 
 use super::journal::now_rfc3339;
@@ -40,6 +40,14 @@ pub struct RunTelemetry {
     pub artifact_resolved_image_id: Option<String>,
     /// Declared boot deadline seconds from v2 manifest (None on v1).
     pub boot_seconds: Option<i64>,
+    /// App-owned contract results for v3 runs (`None` on v1/v2 where no
+    /// contract stage exists; `Some` on v3, possibly empty on early failure).
+    /// `None` preserves legacy `Verified` semantics; `Some` gates `Verified`
+    /// on non-empty all-passed (O3-4, ADR 0005).
+    pub contracts: Option<Vec<ContractEvidence>>,
+    /// Boot isolation block for runs with isolation (`None` when isolation
+    /// did not run, e.g. v1 or pre-boot failure).
+    pub isolation: Option<IsolationEvidence>,
     /// Tables structurally verified in the target database.
     pub verified_tables: Vec<String>,
     /// Additional custom key-value telemetry.
@@ -72,27 +80,66 @@ pub fn resolve_destination_path(destination: &str) -> Option<PathBuf> {
 
 /// Classifies a run outcome into a high-level verdict category, distinguishing verification
 /// from orchestration and cleanup failures.
+///
+/// O3-4 contract/isolation gating (ADR 0005):
+/// - `contracts == None`: legacy v1/v2 path, no contract stage; `Verified`
+///   preserves its old meaning (health/readiness passed).
+/// - `contracts == Some(list)`: v3 path; `Verified` requires non-empty and
+///   all `status == "passed"` with no `code`. Empty or any failure while the
+///   stage verdict is `Passed` demotes to `VerificationFailed`; a stage
+///   verdict already carrying `contract/...` also maps to
+///   `VerificationFailed`. A green health/readiness endpoint alone can never
+///   verify on v3.
+/// - Any stage failure whose `code` starts with `isolation/` maps to the new
+///   `IsolationFailed`, which takes precedence over contract gating and
+///   `BootFailed`.
 pub fn classify_verdict(
     verdict: Option<&Verdict>,
     cleanup: Option<&CleanupStatus>,
     completeness: EvidenceCompleteness,
+    contracts: Option<&[ContractEvidence]>,
+    isolation: Option<&IsolationEvidence>,
 ) -> VerdictClassification {
     if completeness == EvidenceCompleteness::Incomplete {
         return VerdictClassification::Incomplete;
     }
 
+    // Isolation failures dominate: explicit block check plus verdict-code
+    // check so hand-built bundles with `isolation/...` codes classify too.
+    let verdict_is_isolation = matches!(
+        verdict,
+        Some(Verdict::Failed { code, .. }) if code.starts_with("isolation/")
+    );
+    let isolation_block_signals_failure = isolation.map(|iso| iso.egress.allowed).unwrap_or(false);
+    if verdict_is_isolation || isolation_block_signals_failure {
+        return VerdictClassification::IsolationFailed;
+    }
+
     match verdict {
         Some(Verdict::Passed) => {
+            if let Some(list) = contracts {
+                let all_passed = !list.is_empty()
+                    && list
+                        .iter()
+                        .all(|c| c.status == "passed" && c.code.is_none());
+                if !all_passed {
+                    return VerdictClassification::VerificationFailed;
+                }
+            }
             if let Some(CleanupStatus::Failed { .. }) = cleanup {
                 VerdictClassification::CleanupFailed
             } else {
                 VerdictClassification::Verified
             }
         }
-        Some(Verdict::Failed { stage, .. }) => {
-            if *stage == Stage::Boot {
+        Some(Verdict::Failed { stage, code, .. }) => {
+            if code.starts_with("contract/") {
+                VerdictClassification::VerificationFailed
+            } else if code.starts_with("isolation/") {
+                VerdictClassification::IsolationFailed
+            } else if *stage == Stage::Boot {
                 VerdictClassification::BootFailed
-            } else if *stage == Stage::Verification {
+            } else if *stage == Stage::Verification || *stage == Stage::Contracts {
                 VerdictClassification::VerificationFailed
             } else {
                 VerdictClassification::OrchestrationFailed
@@ -199,7 +246,13 @@ pub fn build_evidence_bundle(
         },
     });
 
-    let verdict_classification = classify_verdict(verdict, cleanup, completeness);
+    let verdict_classification = classify_verdict(
+        verdict,
+        cleanup,
+        completeness,
+        telemetry.contracts.as_deref(),
+        telemetry.isolation.as_ref(),
+    );
 
     let declared_manifest_value = serde_json::to_value(manifest).unwrap_or(serde_json::Value::Null);
 
@@ -251,6 +304,8 @@ pub fn build_evidence_bundle(
         },
         artifact: build_artifact_evidence(telemetry),
         stages: stage_evidence,
+        contracts: telemetry.contracts.clone(),
+        isolation: telemetry.isolation.clone(),
         verdict: verdict_evidence,
         verdict_classification,
         cleanup: cleanup_evidence,
@@ -355,4 +410,143 @@ pub fn write_initial_incomplete_evidence(
     );
 
     persist_evidence(&bundle, run_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn passed_contract(name: &str) -> ContractEvidence {
+        ContractEvidence {
+            name: name.to_owned(),
+            kind: "sql".to_owned(),
+            status: "passed".to_owned(),
+            code: None,
+            output: "1".to_owned(),
+            truncated: false,
+            duration_ms: Some(1),
+            rows: 1,
+        }
+    }
+
+    fn failed_contract(name: &str) -> ContractEvidence {
+        ContractEvidence {
+            name: name.to_owned(),
+            kind: "http".to_owned(),
+            status: "failed".to_owned(),
+            code: Some("contract/assert-failed".to_owned()),
+            output: "non-2xx".to_owned(),
+            truncated: false,
+            duration_ms: Some(1),
+            rows: 0,
+        }
+    }
+
+    #[test]
+    fn legacy_none_preserves_verified() {
+        let c = classify_verdict(
+            Some(&Verdict::Passed),
+            Some(&CleanupStatus::Success),
+            EvidenceCompleteness::Complete,
+            None,
+            None,
+        );
+        assert_eq!(c, VerdictClassification::Verified);
+    }
+
+    #[test]
+    fn health_pass_plus_contracts_fail_is_not_verified() {
+        let contracts = vec![passed_contract("a"), failed_contract("b")];
+        let c = classify_verdict(
+            Some(&Verdict::Passed),
+            Some(&CleanupStatus::Success),
+            EvidenceCompleteness::Complete,
+            Some(&contracts),
+            None,
+        );
+        assert_eq!(c, VerdictClassification::VerificationFailed);
+    }
+
+    #[test]
+    fn empty_contracts_is_not_verified() {
+        let empty: Vec<ContractEvidence> = vec![];
+        let c = classify_verdict(
+            Some(&Verdict::Passed),
+            Some(&CleanupStatus::Success),
+            EvidenceCompleteness::Complete,
+            Some(&empty),
+            None,
+        );
+        assert_eq!(c, VerdictClassification::VerificationFailed);
+    }
+
+    #[test]
+    fn all_passed_contracts_verify() {
+        let contracts = vec![passed_contract("a"), passed_contract("b")];
+        let c = classify_verdict(
+            Some(&Verdict::Passed),
+            Some(&CleanupStatus::Success),
+            EvidenceCompleteness::Complete,
+            Some(&contracts),
+            None,
+        );
+        assert_eq!(c, VerdictClassification::Verified);
+    }
+
+    #[test]
+    fn contract_code_maps_to_verification_failed() {
+        let v = Verdict::failed(Stage::Contracts, "contract/timeout", "hung");
+        let c = classify_verdict(
+            Some(&v),
+            Some(&CleanupStatus::Success),
+            EvidenceCompleteness::Complete,
+            Some(&[failed_contract("x")]),
+            None,
+        );
+        assert_eq!(c, VerdictClassification::VerificationFailed);
+    }
+
+    #[test]
+    fn isolation_code_maps_to_isolation_failed() {
+        let v = Verdict::failed(Stage::Boot, "isolation/egress-allowed", "reachable");
+        let c = classify_verdict(
+            Some(&v),
+            Some(&CleanupStatus::Success),
+            EvidenceCompleteness::Complete,
+            Some(&[passed_contract("a")]),
+            None,
+        );
+        assert_eq!(c, VerdictClassification::IsolationFailed);
+
+        let v2 = Verdict::failed(Stage::Boot, "isolation/policy-failed", "no docker");
+        let c2 = classify_verdict(
+            Some(&v2),
+            Some(&CleanupStatus::Success),
+            EvidenceCompleteness::Complete,
+            None,
+            None,
+        );
+        assert_eq!(c2, VerdictClassification::IsolationFailed);
+    }
+
+    #[test]
+    fn isolation_allowed_block_forces_isolation_failed_even_on_pass() {
+        let iso = IsolationEvidence {
+            network: Some("salvage-net-x".to_owned()),
+            allowlist: vec![],
+            egress: salvage_evidence::EgressEvidence {
+                host: "prod-forbidden.invalid".to_owned(),
+                allowed: true,
+                detail: "reachable".to_owned(),
+            },
+        };
+        let c = classify_verdict(
+            Some(&Verdict::Passed),
+            Some(&CleanupStatus::Success),
+            EvidenceCompleteness::Complete,
+            Some(&[passed_contract("a")]),
+            Some(&iso),
+        );
+        assert_eq!(c, VerdictClassification::IsolationFailed);
+    }
 }

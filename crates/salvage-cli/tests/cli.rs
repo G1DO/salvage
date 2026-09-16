@@ -206,3 +206,76 @@ fn run_with_artifact_flag_on_v1_reports_usage() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(r#""code":"usage""#));
 }
+
+#[test]
+fn manifest_check_accepts_v3_contracts() {
+    let path = manifest_fixture("manifest-valid-v3-contracts.json");
+    let output = run(&["manifest", "check", &path]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#""status":"ok""#) && stdout.contains(r#""schema_version":"v3""#),
+        "unexpected stdout: {stdout}"
+    );
+}
+
+#[test]
+fn run_v3_with_wrong_artifact_digest_fails_closed() {
+    // Proves v3 is CLI-wired past the old `usage` early-return (O3-4):
+    // artifact mismatch is checked before any Docker/PG work.
+    let path = manifest_fixture("manifest-valid-v3-contracts.json");
+    let output = run(&[
+        "run",
+        &path,
+        "--artifact",
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(r#""code":"app/digest-mismatch""#));
+}
+
+#[test]
+fn evidence_check_rejects_verified_with_failed_contracts() {
+    // `Verified` with failed contracts can never verify (O3-4 gating).
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
+        "salvage-o34-bad-verified-{}.json",
+        std::process::id()
+    ));
+    let bundle = serde_json::json!({
+        "schema_version": "v1",
+        "completeness": "complete",
+        "run": {"run_id": "o34-bad", "owner": "op", "created_at": "2026-09-16T00:00:00Z",
+                "completed_at": "2026-09-16T00:00:10Z", "total_duration_ms": 10000},
+        "tool": {"name": "salvage", "version": "0.1.0"},
+        "manifest": {"canonical_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     "declared": {}},
+        "backup": {"digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                   "source": "local", "restore_type": "full"},
+        "versions": {"declared_postgres": "16.4"},
+        "limits": {"cpu_millicores": 500, "memory_mib": 1024, "disk_mib": 5120,
+                   "restore_seconds": 60, "verify_seconds": 30},
+        "stages": [{"stage": "contracts", "status": "failed", "duration_ms": 5}],
+        "contracts": [{"name": "health", "kind": "http", "status": "failed",
+                       "code": "contract/assert-failed", "output": "non-2xx",
+                       "truncated": false, "duration_ms": 5, "rows": 0}],
+        "verdict": {"verdict": "passed"},
+        "verdict_classification": "verified",
+        "cleanup": {"status": "success", "errors": []},
+        "events": [],
+        "telemetry": {}
+    });
+    std::fs::write(&path, serde_json::to_string_pretty(&bundle).unwrap()).unwrap();
+    let output = run(&["evidence", "check", &path.to_string_lossy()]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("evidence/incomplete"),
+        "unexpected stderr: {stderr}"
+    );
+}
