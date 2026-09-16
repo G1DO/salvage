@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
 
+use salvage_contracts::{ContractExecutor, ExecOptions, HttpBackend, HttpResponse, SqlBackend};
 use salvage_core::lifecycle::{
-    RunConfig, RunEngine, RunError, RunId, Verdict, install_signal_handler,
+    RunConfig, RunEngine, RunError, RunId, StageContext, StageExecutionError, StageExecutor,
+    Verdict, install_signal_handler,
 };
-use salvage_core::manifest::{AnyManifest, parse_any_manifest_bytes};
+use salvage_core::manifest::{AnyManifest, Contract, ContractKind, parse_any_manifest_bytes};
 use salvage_core::workspace_check;
 use salvage_evidence::{EvidenceCompleteness, parse_evidence_bundle_bytes, render_html_report};
 use salvage_oci::{CompositeBootExecutor, OciBootExecutor};
@@ -256,6 +258,272 @@ fn resolve_backup_path(manifest_path: &Path, expected_digest: &str) -> PathBuf {
     }
 }
 
+/// Production SQL backend for v3 contracts (O3-4): runs the query via `psql`
+/// over the ephemeral Unix socket. No TCP by design (socket-only, like O3-2).
+struct RealSqlBackend {
+    socket_dir: PathBuf,
+    dbname: String,
+}
+
+impl SqlBackend for RealSqlBackend {
+    fn query(
+        &self,
+        query: String,
+        socket_dir: PathBuf,
+    ) -> Result<Vec<String>, salvage_contracts::BackendError> {
+        use salvage_contracts::BackendError;
+        let dir = if socket_dir.as_os_str().is_empty() {
+            self.socket_dir.clone()
+        } else {
+            socket_dir
+        };
+        let psql = std::env::var("POSTGRES_BIN_DIR")
+            .map(|d| format!("{}/psql", d.trim_end_matches('/')))
+            .unwrap_or_else(|_| "psql".to_owned());
+        let output = std::process::Command::new(&psql)
+            .arg("-h")
+            .arg(&dir)
+            .arg("-U")
+            .arg("postgres")
+            .arg("-d")
+            .arg(&self.dbname)
+            .arg("-t")
+            .arg("-A")
+            .arg("-c")
+            .arg(&query)
+            .output()
+            .map_err(|e| BackendError::Crash(format!("failed to spawn psql: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            return Err(BackendError::AssertFailed(format!(
+                "psql exited {}: {}",
+                output.status,
+                stderr.trim()
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let rows: Vec<String> = stdout
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect();
+        Ok(rows)
+    }
+}
+
+/// Production HTTP backend for v3 contracts (O3-4): minimal blocking
+/// HTTP/1.0 client over `TcpStream` (no extra deps). Follows no redirects;
+/// non-2xx is returned so the executor classifies `contract/assert-failed`.
+struct RealHttpBackend;
+
+impl HttpBackend for RealHttpBackend {
+    fn fetch(
+        &self,
+        url: String,
+        method: String,
+    ) -> Result<HttpResponse, salvage_contracts::BackendError> {
+        use salvage_contracts::BackendError;
+        use std::io::{Read, Write};
+        use std::net::{TcpStream, ToSocketAddrs};
+        use std::time::Duration;
+        let (host_port, path) = parse_http_url(&url)?;
+        let addrs = host_port
+            .to_socket_addrs()
+            .map_err(|e| BackendError::Crash(format!("dns resolve {host_port:?}: {e}")))?;
+        let addr = addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| BackendError::Crash(format!("no address for {host_port:?}")))?;
+        // HTTPS is not implemented without TLS deps: fail closed as crash so
+        // evidence records `contract/crash`, never a silent pass.
+        if url.starts_with("https://") {
+            return Err(BackendError::Crash(
+                "https contracts require TLS (not implemented in O3-4)".to_owned(),
+            ));
+        }
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+            .map_err(|e| BackendError::Crash(format!("connect {host_port:?}: {e}")))?;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        let m = method.to_uppercase();
+        let req = format!("{m} {path} HTTP/1.0\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+        stream
+            .write_all(req.as_bytes())
+            .map_err(|e| BackendError::Crash(format!("http write: {e}")))?;
+        let mut raw = Vec::new();
+        stream
+            .read_to_end(&mut raw)
+            .map_err(|e| BackendError::Crash(format!("http read: {e}")))?;
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        let status = parse_http_status(&text)?;
+        let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_owned();
+        let body = if body.is_empty() {
+            text.split("\n\n").nth(1).unwrap_or("").to_owned()
+        } else {
+            body
+        };
+        Ok(HttpResponse { status, body })
+    }
+}
+
+fn parse_http_url(url: &str) -> Result<(String, String), salvage_contracts::BackendError> {
+    use salvage_contracts::BackendError;
+    let after = url
+        .strip_prefix("http://")
+        .ok_or_else(|| BackendError::Malformed(format!("url must be http://, got {url:?}")))?;
+    let (host_port, path) = match after.find('/') {
+        Some(i) => (after[..i].to_owned(), after[i..].to_owned()),
+        None => (after.to_owned(), "/".to_owned()),
+    };
+    if host_port.is_empty() {
+        return Err(BackendError::Malformed(format!(
+            "url must include a host, got {url:?}"
+        )));
+    }
+    let host_port = if host_port.contains(':') {
+        host_port
+    } else {
+        format!("{host_port}:80")
+    };
+    Ok((host_port, path))
+}
+
+fn parse_http_status(raw: &str) -> Result<u16, salvage_contracts::BackendError> {
+    use salvage_contracts::BackendError;
+    let line = raw.lines().next().unwrap_or("");
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return Err(BackendError::Crash(format!(
+            "malformed http status line {line:?}"
+        )));
+    }
+    parts[1]
+        .parse::<u16>()
+        .map_err(|_| BackendError::Crash(format!("bad http status {line:?}")))
+}
+
+fn contract_kind_str(kind: &ContractKind) -> &'static str {
+    match kind {
+        ContractKind::Sql => "sql",
+        ContractKind::Http => "http",
+        ContractKind::Exec => "exec",
+    }
+}
+
+/// v3 stage executor (O3-4): postgres restore + OCI boot (with contract
+/// egress allowlist) + bounded contract execution. `Verified` requires all
+/// contracts passed; failures surface as `contract/...` so the CLI exits 1.
+struct V3Executor {
+    postgres: PostgresStageExecutor,
+    oci: OciBootExecutor,
+    executor: ContractExecutor,
+}
+
+impl V3Executor {
+    fn new(postgres: PostgresStageExecutor, oci: OciBootExecutor, allowlist: Vec<String>) -> Self {
+        let oci = oci.with_allowlist(allowlist);
+        Self {
+            postgres,
+            oci,
+            executor: ContractExecutor::new(),
+        }
+    }
+}
+
+impl StageExecutor for V3Executor {
+    fn execute_validation(
+        &mut self,
+        ctx: &mut StageContext<'_>,
+    ) -> Result<(), StageExecutionError> {
+        self.postgres.execute_validation(ctx)
+    }
+    fn execute_restore(&mut self, ctx: &mut StageContext<'_>) -> Result<(), StageExecutionError> {
+        self.postgres.execute_restore(ctx)?;
+        if let Some(sock) = self.postgres.socket_dir() {
+            self.oci.pg_socket_dir = Some(sock.to_path_buf());
+        }
+        Ok(())
+    }
+    fn execute_verification(
+        &mut self,
+        ctx: &mut StageContext<'_>,
+    ) -> Result<(), StageExecutionError> {
+        self.postgres.execute_verification(ctx)
+    }
+    fn execute_boot(&mut self, ctx: &mut StageContext<'_>) -> Result<(), StageExecutionError> {
+        self.oci.execute_boot(ctx)
+    }
+    fn execute_contracts(
+        &mut self,
+        ctx: &mut StageContext<'_>,
+        contracts: &[Contract],
+    ) -> Result<Vec<salvage_evidence::ContractEvidence>, StageExecutionError> {
+        let socket_dir = self
+            .postgres
+            .socket_dir()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("/var/run/salvage"));
+        let dbname = ctx
+            .telemetry
+            .target_dbname
+            .clone()
+            .unwrap_or_else(|| "salvage_restore".to_owned());
+        let sql = RealSqlBackend { socket_dir, dbname };
+        let http = RealHttpBackend;
+        let exec_opts = ExecOptions::none();
+        let mut out = Vec::with_capacity(contracts.len());
+        for c in contracts {
+            // Socket dir is per-contract (ephemeral cluster); http/exec ignore it.
+            let socket = self
+                .postgres
+                .socket_dir()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| sql.socket_dir.clone());
+            let result = self.executor.execute(c, &socket, &sql, &http, &exec_opts);
+            out.push(salvage_evidence::ContractEvidence {
+                name: result.name.clone(),
+                kind: contract_kind_str(&c.kind).to_owned(),
+                status: result.status.to_string(),
+                code: result.code.clone(),
+                output: result.output.clone(),
+                truncated: result.truncated,
+                duration_ms: Some(result.duration_ms),
+                rows: result.rows,
+            });
+        }
+        Ok(out)
+    }
+    fn telemetry(&self) -> Option<salvage_core::lifecycle::RunTelemetry> {
+        let pg = <PostgresStageExecutor as StageExecutor>::telemetry(&self.postgres);
+        let oci = <OciBootExecutor as StageExecutor>::telemetry(&self.oci);
+        match (pg, oci) {
+            (Some(mut p), Some(o)) => {
+                if p.observed_app_version.is_none() {
+                    p.observed_app_version = o.observed_app_version;
+                }
+                if p.observed_artifact_digest.is_none() {
+                    p.observed_artifact_digest = o.observed_artifact_digest;
+                }
+                if p.declared_artifact_digest.is_none() {
+                    p.declared_artifact_digest = o.declared_artifact_digest;
+                }
+                if p.artifact_repository.is_none() {
+                    p.artifact_repository = o.artifact_repository;
+                }
+                if p.artifact_resolved_image_id.is_none() {
+                    p.artifact_resolved_image_id = o.artifact_resolved_image_id;
+                }
+                p.extra.extend(o.extra);
+                Some(p)
+            }
+            (Some(p), None) => Some(p),
+            (None, Some(o)) => Some(o),
+            (None, None) => None,
+        }
+    }
+}
+
 fn salvage_run(opts: RunOptions) -> (i32, String) {
     install_signal_handler();
 
@@ -394,11 +662,22 @@ fn salvage_run(opts: RunOptions) -> (i32, String) {
             let mut combo = CompositeBootExecutor::new(pg, oci);
             RunEngine::start_run_v2(config, manifest_v2, &mut combo)
         }
-        AnyManifest::V3(_) => {
-            return (
-                2,
-                r#"{"status":"error","code":"usage","message":"v3 contract execution is not implemented yet (O3-1 declares contracts only)"}"#.to_owned(),
-            );
+        AnyManifest::V3(manifest_v3) => {
+            // O3-4: thread declared contracts + isolation allowlist through.
+            // No new flags: contracts come from the manifest.
+            let mut allow: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for c in &manifest_v3.contracts {
+                if let Some(list) = c.egress_allow.as_ref() {
+                    for e in list {
+                        allow.insert(e.trim().to_owned());
+                    }
+                }
+            }
+            let allowlist: Vec<String> = allow.into_iter().collect();
+            let pg = PostgresStageExecutor::new(backup_path).with_expected_table(expected_name);
+            let oci = OciBootExecutor::new(manifest_v3.app.clone(), manifest_v3.limits.clone());
+            let mut executor = V3Executor::new(pg, oci, allowlist);
+            RunEngine::start_run_v3(config, manifest_v3, &mut executor)
         }
     };
     match outcome_res {
