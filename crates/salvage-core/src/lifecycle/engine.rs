@@ -3,7 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::manifest::{Manifest, ManifestV2, manifest_hash, manifest_hash_v2};
+use crate::manifest::{
+    Contract, Manifest, ManifestV2, ManifestV3, manifest_hash, manifest_hash_v2, manifest_hash_v3,
+};
 
 use super::cancellation::{CancellationToken, StageDeadline};
 use super::evidence::{
@@ -102,6 +104,20 @@ pub trait StageExecutor {
     /// overrides this to boot the declared OCI artifact and probe readiness.
     fn execute_boot(&mut self, _ctx: &mut StageContext<'_>) -> Result<(), StageExecutionError> {
         Ok(())
+    }
+
+    /// Executes app-owned recovery contracts (v3 manifests only, O3-4).
+    ///
+    /// The default is a no-op returning no results so v1/v2 executors keep
+    /// working. v3 executors override this to run each declared contract
+    /// (bounded, redacted) and return per-contract evidence. Returning `Err`
+    /// fails the run with that `contract/...` or `isolation/...` code.
+    fn execute_contracts(
+        &mut self,
+        _ctx: &mut StageContext<'_>,
+        _contracts: &[crate::manifest::Contract],
+    ) -> Result<Vec<salvage_evidence::ContractEvidence>, StageExecutionError> {
+        Ok(Vec::new())
     }
 
     /// Returns captured telemetry if provided by the executor.
@@ -238,6 +254,83 @@ fn apply_declared_snapshot(
     redactor.redact_value(&mut bundle.manifest.declared);
 }
 
+/// Builds the structured isolation block for v3 runs (O3-4).
+///
+/// - `network`: per-run `salvage-net-<run-id>` (the `--internal` network O3-3
+///   creates; recorded even if creation later fails, for auditability).
+/// - `allowlist`: sorted deduped union of `contracts[].egress_allow`.
+/// - `egress`: forbidden-host probe outcome from boot telemetry
+///   (`isolation_egress_allowed` / `isolation_forbidden_host` extras). On
+///   boot isolation failure the verdict carries `isolation/...` and `allowed`
+///   is set true so `classify_verdict` maps to `IsolationFailed`.
+fn build_isolation_evidence(
+    run_id: &RunId,
+    contracts: &[Contract],
+    telemetry: &RunTelemetry,
+    verdict: Option<&Verdict>,
+) -> Option<salvage_evidence::IsolationEvidence> {
+    use std::collections::BTreeSet;
+    let mut allow: BTreeSet<String> = BTreeSet::new();
+    for c in contracts {
+        if let Some(list) = c.egress_allow.as_ref() {
+            for e in list {
+                allow.insert(e.trim().to_owned());
+            }
+        }
+    }
+    let allowlist: Vec<String> = allow.into_iter().collect();
+    let host = telemetry
+        .extra
+        .get("isolation_forbidden_host")
+        .cloned()
+        .unwrap_or_else(|| "prod-forbidden.invalid".to_owned());
+    let blocked_ok = telemetry
+        .extra
+        .get("isolation_egress_allowed")
+        .map(|v| v == "false")
+        .unwrap_or(false);
+    let verdict_is_isolation = matches!(
+        verdict,
+        Some(Verdict::Failed { code, .. }) if code.starts_with("isolation/")
+    );
+    // Record a block whenever isolation ran (probe ok) or failed closed.
+    // v3 runs always record; callers gate on `contracts.is_some()`.
+    let detail = if verdict_is_isolation {
+        if let Some(Verdict::Failed { message, .. }) = verdict {
+            message.clone()
+        } else {
+            "isolation policy failure".to_owned()
+        }
+    } else if blocked_ok {
+        "forbidden egress blocked (default-deny)".to_owned()
+    } else {
+        // Boot did not reach the probe (early failure): still record the
+        // deny-all network + allowlist so the intent is auditable.
+        "isolation pending (boot did not reach egress probe)".to_owned()
+    };
+    let allowed = verdict_is_isolation
+        && matches!(
+            verdict,
+            Some(Verdict::Failed { code, .. }) if code == "isolation/egress-allowed"
+        );
+    // Redact before persist (defense in depth; bundle builder redacts again).
+    let mut redactor = salvage_evidence::SecretRedactor::new();
+    redactor.add_env_secrets();
+    let network = format!("salvage-net-{}", run_id.as_str());
+    Some(salvage_evidence::IsolationEvidence {
+        network: Some(redactor.redact_text(&network)),
+        allowlist: allowlist
+            .into_iter()
+            .map(|e| redactor.redact_text(&e))
+            .collect(),
+        egress: salvage_evidence::EgressEvidence {
+            host: redactor.redact_text(&host),
+            allowed,
+            detail: redactor.redact_text(&detail),
+        },
+    })
+}
+
 /// The engine that drives the recovery run lifecycle through its states and stages.
 pub struct RunEngine;
 
@@ -268,7 +361,7 @@ impl RunEngine {
     ) -> Result<RunOutcome, RunError> {
         let hash = manifest_hash(&manifest);
         let declared = serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null);
-        Self::run_inner(config, manifest, hash, declared, boot, executor)
+        Self::run_inner(config, manifest, hash, declared, boot, None, executor)
     }
 
     /// Executes a bounded recovery run for a v2 manifest (with boot stage).
@@ -295,6 +388,36 @@ impl RunEngine {
             hash,
             declared,
             boot,
+            None,
+            executor,
+        )
+    }
+
+    /// Executes a bounded recovery run for a v3 manifest (boot + contracts, O3-4).
+    ///
+    /// Like `start_run_v2` but additionally runs the declared `contracts[]`
+    /// after a successful boot via `StageExecutor::execute_contracts` and
+    /// records the structured `isolation{egress}` block. `Verified` requires
+    /// contracts non-empty and all passed; a green boot alone can never
+    /// verify (ADR 0005).
+    pub fn start_run_v3(
+        config: RunConfig,
+        manifest: ManifestV3,
+        executor: &mut impl StageExecutor,
+    ) -> Result<RunOutcome, RunError> {
+        let hash = manifest_hash_v3(&manifest);
+        let declared = serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null);
+        let boot = Some(BootPolicy {
+            boot_seconds: manifest.deadlines.boot_seconds,
+        });
+        let contracts = manifest.contracts.clone();
+        Self::run_inner(
+            config,
+            manifest.core_manifest(),
+            hash,
+            declared,
+            boot,
+            Some(contracts),
             executor,
         )
     }
@@ -305,6 +428,7 @@ impl RunEngine {
         hash: String,
         declared_manifest: serde_json::Value,
         boot: Option<BootPolicy>,
+        contracts: Option<Vec<Contract>>,
         executor: &mut impl StageExecutor,
     ) -> Result<RunOutcome, RunError> {
         let run_id = config.run_id;
@@ -759,6 +883,151 @@ impl RunEngine {
             });
         }
 
+        // Stage 5: Contracts (v3 manifests only, O3-4).
+        //
+        // v1/v2 runs (`contracts == None`) skip this block entirely so v1
+        // evidence is unchanged. v3 runs initialize `telemetry.contracts` to
+        // `Some([])` so an early failure can never verify (empty => not
+        // Verified), then replace it with real results after a successful
+        // boot. Isolation block is built from the boot probe telemetry.
+        if let Some(ref declared_contracts) = contracts {
+            if telemetry.contracts.is_none() {
+                telemetry.contracts = Some(Vec::new());
+            }
+            // Build isolation evidence for v3 runs (even on boot failure, so
+            // the deny-all network + probe outcome is auditable).
+            if telemetry.isolation.is_none() {
+                telemetry.isolation = build_isolation_evidence(
+                    &run_id,
+                    declared_contracts,
+                    &telemetry,
+                    final_verdict.as_ref(),
+                );
+            }
+            if final_verdict.as_ref().is_some_and(Verdict::is_passed) {
+                let contracts_start = Instant::now();
+                journal.record_event(EventPayload::StageStarted {
+                    stage: Stage::Contracts,
+                    deadline_seconds: 0,
+                })?;
+                if config.cancellation_token.is_cancelled() {
+                    let sig = config.cancellation_token.cancellation_signal();
+                    final_verdict = Some(Verdict::cancelled(
+                        Stage::Contracts,
+                        sig,
+                        "cancelled before contracts",
+                    ));
+                } else {
+                    // Generous outer deadline: sum of per-contract budgets is
+                    // enforced inside `execute_contracts`; here we only guard
+                    // cancellation. Use a dummy far-future deadline.
+                    let contracts_deadline =
+                        StageDeadline::new(Duration::from_secs(3600), global_deadline);
+                    let mut ctx = StageContext {
+                        run_id: &run_id,
+                        manifest: &manifest,
+                        manifest_hash: &hash,
+                        resource_manager: &mut resource_manager,
+                        deadline: &contracts_deadline,
+                        cancellation_token: &config.cancellation_token,
+                        journal: &journal,
+                        telemetry: &mut telemetry,
+                    };
+                    match executor.execute_contracts(&mut ctx, declared_contracts) {
+                        Ok(results) => {
+                            let failed = results
+                                .iter()
+                                .find(|c| c.status != "passed" || c.code.is_some())
+                                .cloned();
+                            let returned = results.len();
+                            let declared = declared_contracts.len();
+                            // Store redacted results (executor already
+                            // redacts; bundle builder redacts again).
+                            ctx.telemetry.contracts = Some(results);
+                            // Rebuild isolation in case contracts execution
+                            // populated more telemetry (no-op otherwise).
+                            journal.record_event(EventPayload::StageCompleted {
+                                stage: Stage::Contracts,
+                                duration_ms: contracts_start.elapsed().as_millis() as u64,
+                            })?;
+                            if let Some(bad) = failed {
+                                let code = bad
+                                    .code
+                                    .clone()
+                                    .unwrap_or_else(|| "contract/assert-failed".to_owned());
+                                let msg =
+                                    format!("contract `{}` {}: {}", bad.name, bad.status, code);
+                                final_verdict = Some(Verdict::failed(Stage::Contracts, code, msg));
+                            } else if declared == 0 || returned == 0 || returned != declared {
+                                // Noop/mismatched runners can never verify:
+                                // empty or partial results fail closed.
+                                final_verdict = Some(Verdict::failed(
+                                    Stage::Contracts,
+                                    "contract/empty",
+                                    format!(
+                                        "contracts incomplete: declared {declared}, returned {returned}"
+                                    ),
+                                ));
+                            } else {
+                                // Keep Passed; classify_verdict will gate
+                                // Verified on non-empty all-passed.
+                            }
+                        }
+                        Err(StageExecutionError::Failed { code, message }) => {
+                            journal.record_event(EventPayload::StageFailed {
+                                stage: Stage::Contracts,
+                                code: code.clone(),
+                                message: message.clone(),
+                            })?;
+                            // Ensure v3 evidence carries a contracts block
+                            // even when the runner fails wholesale.
+                            if ctx.telemetry.contracts.is_none() {
+                                ctx.telemetry.contracts = Some(Vec::new());
+                            }
+                            final_verdict = Some(Verdict::failed(Stage::Contracts, code, message));
+                        }
+                        Err(StageExecutionError::TimedOut) => {
+                            journal.record_event(EventPayload::StageTimedOut {
+                                stage: Stage::Contracts,
+                                timeout_seconds: 0,
+                            })?;
+                            final_verdict = Some(Verdict::timed_out(Stage::Contracts, 0));
+                        }
+                        Err(StageExecutionError::Cancelled { signal, reason }) => {
+                            journal.record_event(EventPayload::StageCancelled {
+                                stage: Stage::Contracts,
+                                signal: signal.clone(),
+                                reason: reason.clone(),
+                            })?;
+                            final_verdict =
+                                Some(Verdict::cancelled(Stage::Contracts, signal, reason));
+                        }
+                    }
+                }
+                // Refresh isolation after contracts (probe detail unchanged,
+                // but allowlist union is stable).
+                if telemetry.isolation.is_none() {
+                    telemetry.isolation = build_isolation_evidence(
+                        &run_id,
+                        declared_contracts,
+                        &telemetry,
+                        final_verdict.as_ref(),
+                    );
+                }
+
+                stage_timings.push(StageTimingRecord {
+                    stage: "contracts".to_owned(),
+                    status: match &final_verdict {
+                        None | Some(Verdict::Passed) => "passed".to_owned(),
+                        Some(Verdict::Failed { .. }) => "failed".to_owned(),
+                        Some(Verdict::TimedOut { .. }) => "timed-out".to_owned(),
+                        Some(Verdict::Cancelled { .. }) => "cancelled".to_owned(),
+                    },
+                    duration_ms: Some(contracts_start.elapsed().as_millis() as u64),
+                });
+            }
+        }
+
         let mut verdict = final_verdict.unwrap_or(Verdict::Passed);
 
         // Terminal transition
@@ -837,6 +1106,12 @@ impl RunEngine {
             }
             if telemetry.boot_seconds.is_none() {
                 telemetry.boot_seconds = exec_telem.boot_seconds;
+            }
+            if telemetry.contracts.is_none() {
+                telemetry.contracts = exec_telem.contracts;
+            }
+            if telemetry.isolation.is_none() {
+                telemetry.isolation = exec_telem.isolation;
             }
             if telemetry.verified_tables.is_empty() {
                 telemetry.verified_tables = exec_telem.verified_tables;
@@ -1288,6 +1563,168 @@ mod tests {
         let bundle: serde_json::Value = serde_json::from_str(&evidence).unwrap();
         assert_eq!(bundle["manifest"]["declared"]["schema_version"], "v2");
 
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    const VALID_V3_MANIFEST: &str = r#"{
+        "schema_version": "v3",
+        "backup": {"digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+        "postgres": {"version": "16.4"},
+        "restore": {"source": "s3", "type": "full"},
+        "app": {
+            "digest": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "tag": "v1.2.3",
+            "readiness": {"type": "tcp", "port": 8080}
+        },
+        "contracts": [
+            {"name": "users-count", "kind": "sql", "spec": {"query": "SELECT 1"}, "timeout_ms": 5000},
+            {"name": "health", "kind": "http", "spec": {"url": "https://api.example.com/healthz"}, "timeout_ms": 5000, "egress_allow": ["api.example.com"]}
+        ],
+        "limits": {"cpu_millicores": 500, "memory_mib": 1024, "disk_mib": 5120},
+        "deadlines": {"restore_seconds": 600, "verify_seconds": 300, "boot_seconds": 120},
+        "evidence": {"destination": "file:///tmp/salvage-evidence"},
+        "run": {"owner": "recovery-drill"}
+    }"#;
+
+    struct PassingContractsExecutor;
+    impl StageExecutor for PassingContractsExecutor {
+        fn execute_contracts(
+            &mut self,
+            _ctx: &mut StageContext<'_>,
+            contracts: &[crate::manifest::Contract],
+        ) -> Result<Vec<salvage_evidence::ContractEvidence>, StageExecutionError> {
+            Ok(contracts
+                .iter()
+                .map(|c| salvage_evidence::ContractEvidence {
+                    name: c.name.clone(),
+                    kind: match c.kind {
+                        crate::manifest::ContractKind::Sql => "sql".to_owned(),
+                        crate::manifest::ContractKind::Http => "http".to_owned(),
+                        crate::manifest::ContractKind::Exec => "exec".to_owned(),
+                    },
+                    status: "passed".to_owned(),
+                    code: None,
+                    output: "ok".to_owned(),
+                    truncated: false,
+                    duration_ms: Some(1),
+                    rows: 1,
+                })
+                .collect())
+        }
+    }
+
+    struct FailingContractsExecutor {
+        canary: String,
+    }
+    impl StageExecutor for FailingContractsExecutor {
+        fn execute_contracts(
+            &mut self,
+            _ctx: &mut StageContext<'_>,
+            _contracts: &[crate::manifest::Contract],
+        ) -> Result<Vec<salvage_evidence::ContractEvidence>, StageExecutionError> {
+            Ok(vec![salvage_evidence::ContractEvidence {
+                name: "health".to_owned(),
+                kind: "http".to_owned(),
+                status: "failed".to_owned(),
+                code: Some("contract/assert-failed".to_owned()),
+                output: format!("body leak {}", self.canary),
+                truncated: false,
+                duration_ms: Some(2),
+                rows: 0,
+            }])
+        }
+    }
+
+    #[test]
+    fn v3_noop_contracts_never_verify() {
+        use crate::manifest::parse_manifest_v3;
+        let temp_dir =
+            std::env::temp_dir().join(format!("salvage-engine-v3-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let manifest = parse_manifest_v3(VALID_V3_MANIFEST).unwrap();
+        let run_id = RunId::new("test-v3-empty-run").unwrap();
+        let config = RunConfig::new(run_id, temp_dir.clone());
+        let mut executor = DefaultStageExecutor;
+        let outcome = RunEngine::start_run_v3(config, manifest, &mut executor).unwrap();
+        // Empty contracts (noop executor) must fail, never verify.
+        assert!(matches!(
+            outcome.verdict,
+            Verdict::Failed { ref code, .. } if code.starts_with("contract/")
+        ));
+        let evidence = std::fs::read_to_string(temp_dir.join("evidence.json")).unwrap();
+        let bundle = salvage_evidence::parse_evidence_bundle(&evidence).unwrap();
+        assert_eq!(
+            bundle.verdict_classification,
+            salvage_evidence::VerdictClassification::VerificationFailed
+        );
+        assert!(bundle.contracts.is_some());
+        assert!(bundle.isolation.is_some());
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn v3_passing_contracts_verify_with_isolation_block() {
+        use crate::manifest::parse_manifest_v3;
+        let temp_dir =
+            std::env::temp_dir().join(format!("salvage-engine-v3-pass-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let manifest = parse_manifest_v3(VALID_V3_MANIFEST).unwrap();
+        let run_id = RunId::new("test-v3-pass-run").unwrap();
+        let config = RunConfig::new(run_id, temp_dir.clone());
+        let mut executor = PassingContractsExecutor;
+        let outcome = RunEngine::start_run_v3(config, manifest, &mut executor).unwrap();
+        assert!(outcome.verdict.is_passed());
+        let evidence = std::fs::read_to_string(temp_dir.join("evidence.json")).unwrap();
+        let bundle = salvage_evidence::parse_evidence_bundle(&evidence).unwrap();
+        assert_eq!(
+            bundle.verdict_classification,
+            salvage_evidence::VerdictClassification::Verified
+        );
+        let contracts = bundle.contracts.expect("contracts");
+        assert_eq!(contracts.len(), 2);
+        assert!(contracts.iter().all(|c| c.status == "passed"));
+        let iso = bundle.isolation.expect("isolation");
+        assert!(iso.allowlist.contains(&"api.example.com".to_owned()));
+        assert!(!iso.egress.allowed);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn v3_failing_contract_canary_is_redacted_and_not_verified() {
+        use crate::manifest::parse_manifest_v3;
+        let canary = "CANARY_V3_CONTRACT_SECRET_999";
+        unsafe {
+            std::env::set_var("SALVAGE_V3_CONTRACT_SECRET", canary);
+        }
+        let temp_dir =
+            std::env::temp_dir().join(format!("salvage-engine-v3-canary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let manifest = parse_manifest_v3(VALID_V3_MANIFEST).unwrap();
+        let run_id = RunId::new("test-v3-fail-run").unwrap();
+        let config = RunConfig::new(run_id, temp_dir.clone());
+        let mut executor = FailingContractsExecutor {
+            canary: canary.to_owned(),
+        };
+        let outcome = RunEngine::start_run_v3(config, manifest, &mut executor).unwrap();
+        assert!(matches!(
+            outcome.verdict,
+            Verdict::Failed { ref code, .. } if code == "contract/assert-failed"
+        ));
+        let evidence = std::fs::read_to_string(temp_dir.join("evidence.json")).unwrap();
+        assert!(
+            !evidence.contains(canary),
+            "contract canary must not survive in evidence.json"
+        );
+        let html = std::fs::read_to_string(temp_dir.join("report.html")).unwrap();
+        assert!(
+            !html.contains(canary),
+            "contract canary must not survive in report.html"
+        );
+        let bundle = salvage_evidence::parse_evidence_bundle(&evidence).unwrap();
+        assert_eq!(
+            bundle.verdict_classification,
+            salvage_evidence::VerdictClassification::VerificationFailed
+        );
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

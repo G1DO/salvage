@@ -35,6 +35,10 @@ pub struct OciBootExecutor {
     pub observed_resolved_image_id: Option<String>,
     pub observed_container_id_short: Option<String>,
     pub boot_duration_ms: Option<u64>,
+    /// Egress allowlist union from v3 `contracts[].egress_allow` (validated,
+    /// still denied in O3-3/O3-4; retained for evidence and future proxy).
+    /// Empty means deny-all.
+    pub allowlist: Vec<String>,
 }
 
 impl OciBootExecutor {
@@ -49,7 +53,14 @@ impl OciBootExecutor {
             observed_resolved_image_id: None,
             observed_container_id_short: None,
             boot_duration_ms: None,
+            allowlist: Vec::new(),
         }
+    }
+
+    /// Sets the egress allowlist union for v3 contract runs.
+    pub fn with_allowlist(mut self, allowlist: Vec<String>) -> Self {
+        self.allowlist = allowlist;
+        self
     }
 
     pub fn with_pg_socket_dir(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -84,13 +95,14 @@ impl StageExecutor for OciBootExecutor {
             ctx.deadline,
             ctx.cancellation_token,
         )?;
-        let handle = start_app_container(
+        let handle = start_app_container_with_allowlist(
             &runtime,
             &identity,
             &self.app,
             ctx.run_id,
             &self.limits,
             self.pg_socket_dir.as_deref(),
+            &self.allowlist,
             ctx.resource_manager,
             ctx.deadline,
             ctx.cancellation_token,
@@ -187,6 +199,8 @@ impl StageExecutor for OciBootExecutor {
             artifact_repository: self.app.repository.clone(),
             artifact_resolved_image_id: self.observed_resolved_image_id.clone(),
             boot_seconds: None,
+            contracts: None,
+            isolation: None,
             verified_tables: Vec::new(),
             extra: Default::default(),
         })
@@ -246,6 +260,8 @@ impl StageExecutor for CompositeBootExecutor {
             artifact_repository: oci_telem.app.repository.clone(),
             artifact_resolved_image_id: oci_telem.observed_resolved_image_id.clone(),
             boot_seconds: None,
+            contracts: None,
+            isolation: None,
             verified_tables: pg_telem.verified_tables.clone(),
             extra: Default::default(),
         };

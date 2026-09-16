@@ -16,6 +16,8 @@ pub enum Stage {
     Verification,
     /// Application OCI boot and readiness probing (v2 manifests only).
     Boot,
+    /// App-owned recovery contracts (v3 manifests only, O3-4).
+    Contracts,
 }
 
 impl std::fmt::Display for Stage {
@@ -26,6 +28,7 @@ impl std::fmt::Display for Stage {
             Self::Restore => write!(f, "restore"),
             Self::Verification => write!(f, "verification"),
             Self::Boot => write!(f, "boot"),
+            Self::Contracts => write!(f, "contracts"),
         }
     }
 }
