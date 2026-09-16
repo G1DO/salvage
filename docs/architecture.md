@@ -9,6 +9,7 @@ Current implemented truth. Code is canonical; this file links it.
 - `crates/salvage-postgres`: PostgreSQL adapter boundary. Preflight + restore `crates/salvage-postgres/src/restore.rs:20-60`.
 - `crates/salvage-evidence`: canonical evidence schema + deterministic projections. `crates/salvage-evidence/src/lib.rs:1-6`, `bundle.rs`.
 - `crates/salvage-oci`: OCI boot executor (v2 only).
+- `crates/salvage-contracts`: recovery contract executor core (O3-2, bounded + classified, not yet wired to CLI/evidence). Types `crates/salvage-contracts/src/outcome.rs`, caps `crates/salvage-contracts/src/caps.rs`, runners `crates/salvage-contracts/src/executor.rs`.
 
 ## Run lifecycle
 
@@ -39,3 +40,11 @@ Current implemented truth. Code is canonical; this file links it.
 - `evidence.json` (v1) is canonical; `report.html`/text are deterministic projections. Non-deterministic fields excluded from golden comparison (run_id, timestamps, durations).
 - `Verdict`: `verified` | `verification-failed` | `boot-failed` | `orchestration-failed` | `cleanup-failed` | `timed-out` | `cancelled` | `incomplete`. `completeness`: `complete` vs `incomplete`.
 - `SecretRedactor` strips credentials/connection strings/keys/headers before persistence/projection.
+
+## Recovery contracts (O3-2 core, unwired)
+
+- Declared in `v3` manifests (`contracts[]`, see `crates/salvage-core/src/manifest.rs:80-96`); executed by `ContractExecutor` against the booted artifact with per-contract `timeout_ms` budgets.
+- Result taxonomy: `passed` | `failed` | `timed-out` plus one `contract/*` code (`contract/timeout`, `contract/malformed`, `contract/oversized`, `contract/crash`, `contract/assert-failed`).
+- Caps: output bytes (default 64 KiB), rows (default 1000), duration (`timeout_ms`), argv allowlist, no shell. `sql` handles are Unix-socket-only (no TCP param). Output is truncated to caps and passed through `SecretRedactor` before assert/persist.
+- `sql`/`http` run through injected backends (unit fakes; no Docker, no PG, no real sockets in tests). `exec` spawns real children in isolated groups; timeout kills the group (`SIGTERM → SIGKILL` + reap, pid reported for leak asserts).
+- Out of scope here: network policy, evidence schema change, CLI wiring, Docker E2E (later O3 slices).
