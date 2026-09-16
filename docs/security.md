@@ -3,13 +3,13 @@
 ## Trust boundaries
 
 - Manifest (untrusted input) → validator (fail-closed, `manifest/...`) → isolated runners (PG + OCI) → redacted evidence.
-- Recovery drills never contact production: ephemeral `initdb` cluster, Unix socket only (`listen_addresses = ''`), scratch dirs owned per `RunId`.
+- Recovery drills never contact production: ephemeral `initdb` cluster, Unix socket only (`listen_addresses = ''`), scratch dirs owned per `RunId`; OCI boot on per-run `--internal` network (`salvage-net-<run-id>`, default-deny, ADR 0004) + PG-socket mount only.
 - Supply chain: `--locked` everywhere, pinned toolchain `1.92.0`, pinned GitHub Actions + Dependabot for cargo/actions. Secrets never in manifests/fixtures/evidence.
 
 ## Controls
 
 - Backup: SHA-256 must equal `manifest.backup.digest` + `PGDMP` magic before any spawn; else `restore/digest-mismatch` / `corrupt-backup`.
-- OCI: pull by `sha256:` digest only; mutable `latest` rejected; `--artifact` override must match manifest digest.
+- OCI: pull by `sha256:` digest only; mutable `latest` rejected; `--artifact` override must match manifest digest. Boot default-deny: per-run `--internal` network, forbidden-egress probe to `prod-forbidden.invalid` (blocked → `allowed:false`, reachable → `isolation/egress-allowed`), policy error → `isolation/policy-failed` fail-closed (never `bridge`); container + network removed on pass/fail via `ResourceManager`.
 - Evidence: `SecretRedactor` removes credentials, connection strings, private keys, auth headers, env secrets before `evidence.json` persistence and `report.html` projection (see `redaction_canary` test).
 - Processes: isolated groups, `SIGTERM→SIGKILL` + reap; cleanup scoped to owned resources only.
 

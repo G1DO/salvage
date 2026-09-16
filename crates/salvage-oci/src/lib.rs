@@ -8,12 +8,19 @@ use salvage_core::manifest::{AppArtifact, Limits};
 pub mod compat;
 pub mod container;
 pub mod image;
+pub mod isolation;
 pub mod probe;
 pub mod runtime;
 
 pub use compat::{check_compat, reverify_post_boot};
-pub use container::{ContainerHandle, parse_docker_port, start_app_container};
+pub use container::{
+    ContainerHandle, parse_docker_port, start_app_container, start_app_container_with_allowlist,
+};
 pub use image::{ImageIdentity, ensure_image};
+pub use isolation::{
+    CODE_EGRESS_ALLOWED, CODE_POLICY_FAILED, EgressProbeResult, FORBIDDEN_EGRESS_HOST,
+    NetworkPolicy, ensure_isolated_network, isolated_network_name, probe_forbidden_egress,
+};
 pub use probe::{http_probe_once, tcp_probe_once, wait_ready};
 pub use runtime::{ContainerRuntime, MIN_DOCKER_MAJOR};
 
@@ -88,6 +95,26 @@ impl StageExecutor for OciBootExecutor {
             ctx.deadline,
             ctx.cancellation_token,
         )?;
+        // O3-3 forbidden-egress evidence: deny-all network must block the
+        // fake prod host. Blocked records `allowed:false`; reachable becomes
+        // `Failed{Boot, isolation/egress-allowed}` via the `?` below (never
+        // `Verified`). Container + network cleanup still runs via the engine
+        // `release_all` on both paths.
+        let egress = probe_forbidden_egress(
+            &runtime,
+            &handle,
+            FORBIDDEN_EGRESS_HOST,
+            ctx.resource_manager,
+            ctx.deadline,
+            ctx.cancellation_token,
+        )?;
+        ctx.telemetry.extra.insert(
+            "isolation_egress_allowed".to_owned(),
+            egress.allowed.to_string(),
+        );
+        ctx.telemetry
+            .extra
+            .insert("isolation_forbidden_host".to_owned(), egress.host.clone());
         wait_ready(
             &runtime,
             &handle,

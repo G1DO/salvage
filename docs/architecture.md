@@ -8,7 +8,7 @@ Current implemented truth. Code is canonical; this file links it.
 - `crates/salvage-core`: manifest + lifecycle/domain. Manifest spec `crates/salvage-core/src/manifest.rs:1-79`. Lifecycle spec `crates/salvage-core/src/lifecycle/mod.rs:1-52`.
 - `crates/salvage-postgres`: PostgreSQL adapter boundary. Preflight + restore `crates/salvage-postgres/src/restore.rs:20-60`.
 - `crates/salvage-evidence`: canonical evidence schema + deterministic projections. `crates/salvage-evidence/src/lib.rs:1-6`, `bundle.rs`.
-- `crates/salvage-oci`: OCI boot executor (v2 only).
+- `crates/salvage-oci`: OCI boot executor (v2 only) with default-deny isolation (O3-3). Policy `crates/salvage-oci/src/isolation.rs`, decision `docs/decisions/0004-boot-isolation-default-deny.md`.
 - `crates/salvage-contracts`: recovery contract executor core (O3-2, bounded + classified, not yet wired to CLI/evidence). Types `crates/salvage-contracts/src/outcome.rs`, caps `crates/salvage-contracts/src/caps.rs`, runners `crates/salvage-contracts/src/executor.rs`.
 
 ## Run lifecycle
@@ -17,7 +17,7 @@ Current implemented truth. Code is canonical; this file links it.
 
 - v1 short-circuits `Verifying → Terminal`. v2 runs `Booting` after verification via `RunEngine::start_run_v2` with `deadlines.boot_seconds`.
 - `RunOutcome` keeps primary `Verdict` separate from `CleanupStatus`; cleanup failure never masks root cause.
-- Resources (`OwnedResource` + `RunId`) are scoped per-run; cleanup is reverse-order, idempotent. Safe re-entry via `StaleResources` / `AlreadyExists`.
+- Resources (`OwnedResource` + `RunId`) are scoped per-run; cleanup is reverse-order, idempotent. Order: containers, then isolated networks (`Network{name}`, `docker network rm`), then process groups, files, dirs. Safe re-entry via `StaleResources` / `AlreadyExists`.
 - Processes run in isolated groups (`PGID == PID`); `SIGTERM → SIGKILL` broadcast + reap on timeout/cancel.
 - `journal.jsonl` (append-only) + atomic `state.json` per state change; `diagnose_run` for post-mortem. Run dir preserves `evidence.json`, `report.html`, `journal.jsonl`, `state.json`.
 
@@ -33,7 +33,7 @@ Current implemented truth. Code is canonical; this file links it.
 
 - `ManifestV2.app`: `digest: sha256:<64hex>` required; `repository`, `tag` optional (`latest`/ `@`/`:` rejected as `app-tag`); `readiness`: `tcp{host?,port}` | `http{host?,port,path}` | `exec{command[]}`.
 - `salvage run --artifact <repo@sha256:...>` requires v2; digest part after last `@` must equal `manifest.app.digest` or `app/digest-mismatch` (exit 1).
-- Boot pulls by digest, probes readiness within `boot_seconds`, re-verifies tables post-boot, records `artifact` + `boot` evidence. Wrong digest → `boot-failed`, no container leaked. Crash (`false`) → `app/crash`, hang → `timed-out`, SIGINT/SIGTERM → `cancelled`.
+- Boot pulls by digest, starts on per-run `--internal` network (`salvage-net-<run-id>`, default-deny, `-P` retained as no-op), probes forbidden egress (`prod-forbidden.invalid` → `allowed:false`, reachable → `isolation/egress-allowed`), probes readiness within `boot_seconds` (host mapped-port first, then in-container `nc`/`wget` fallback for `--internal`), re-verifies tables post-boot, records `artifact` + `boot` + `isolation_*` evidence. Wrong digest → `boot-failed`, no container/network leaked. Crash (`false`) → `app/crash`, hang → `timed-out`, SIGINT/SIGTERM → `cancelled`. Policy error → `isolation/policy-failed` fail-closed, never `bridge`.
 
 ## Evidence
 

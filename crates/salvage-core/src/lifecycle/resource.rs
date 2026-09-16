@@ -72,6 +72,17 @@ pub enum ResourceKind {
         /// Container runtime binary used for removal.
         runtime_bin: PathBuf,
     },
+    /// An isolated OCI network owned by a run (O3-3 default-deny).
+    ///
+    /// Created per-run with `docker network create --internal`; removed with
+    /// `docker network rm` during release. Containers must be removed before
+    /// their network, so release order is containers first, then networks.
+    Network {
+        /// Docker network name (`salvage-net-<run-id>`).
+        name: String,
+        /// Container runtime binary used for removal.
+        runtime_bin: PathBuf,
+    },
 }
 
 /// Removes a container via runtime rm -f with 5s timeout.
@@ -123,6 +134,54 @@ pub fn remove_container(runtime_bin: &Path, id: &str) -> Result<(), String> {
     }
 }
 
+/// Removes an isolated network via runtime `network rm` with 5s timeout.
+///
+/// Idempotent: output containing `No such network` (any case) is success.
+pub fn remove_network(runtime_bin: &Path, name: &str) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+    let mut child = Command::new(runtime_bin)
+        .arg("network")
+        .arg("rm")
+        .arg(name)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn network removal: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child
+            .try_wait()
+            .map_err(|e| format!("failed waiting on network removal: {e}"))?
+        {
+            Some(status) => {
+                if status.success() {
+                    return Ok(());
+                }
+                let output = child
+                    .wait_with_output()
+                    .map_err(|e| format!("failed reading network removal output: {e}"))?;
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if combined.to_lowercase().contains("no such network") {
+                    return Ok(());
+                }
+                return Err(combined.trim().to_owned());
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("network removal timed out after 5s".to_owned());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+}
 /// A system resource tagged with an explicit run ownership identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnedResource {
@@ -284,6 +343,33 @@ impl ResourceManager {
         resource_id
     }
 
+    /// Registers an isolated OCI network as owned by this run (O3-3).
+    ///
+    /// Removal is via `docker network rm` during release calls (after
+    /// containers, before process groups). Idempotent: re-registering the
+    /// same name returns the existing ID.
+    pub fn register_network(
+        &mut self,
+        name: impl Into<String>,
+        runtime_bin: impl Into<PathBuf>,
+    ) -> String {
+        let name = name.into();
+        let resource_id = format!("network:{name}");
+        if !self.resources.iter().any(|r| r.resource_id == resource_id) {
+            self.resources.push(OwnedResource {
+                resource_id: resource_id.clone(),
+                run_id: self.run_id.clone(),
+                kind: ResourceKind::Network {
+                    name,
+                    runtime_bin: runtime_bin.into(),
+                },
+                acquired_at_rfc3339: now_rfc3339(),
+                released: false,
+            });
+        }
+        resource_id
+    }
+
     /// Releases a single resource by its ID. Idempotent.
     pub fn release_resource(&mut self, resource_id: &str) -> Result<(), ResourceError> {
         if let Some(res) = self
@@ -313,6 +399,20 @@ impl ResourceManager {
                 ResourceKind::ProcessGroup { pgid, .. } => {
                     let _ = terminate_process_group(*pgid, Duration::from_millis(100));
                 }
+                ResourceKind::Network { name, runtime_bin } => {
+                    match remove_network(runtime_bin, name) {
+                        Ok(()) => {}
+                        Err(msg) if msg.to_lowercase().contains("no such network") => {}
+                        Err(msg) => {
+                            return Err(ResourceError::Io {
+                                path: runtime_bin.clone(),
+                                source: std::io::Error::other(format!(
+                                    "failed to remove network {name}: {msg}"
+                                )),
+                            });
+                        }
+                    }
+                }
                 ResourceKind::File { path } => {
                     if path.exists() {
                         std::fs::remove_file(path).map_err(|err| ResourceError::Io {
@@ -338,7 +438,7 @@ impl ResourceManager {
 
     /// Idempotently releases and cleans up all owned resources in reverse acquisition order.
     ///
-    /// Order: containers first, then process groups, files, directories.
+    /// Order: containers first, then networks, process groups, files, directories.
     pub fn release_all(&mut self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
@@ -356,7 +456,21 @@ impl ResourceManager {
             }
         }
 
-        // 2. Terminate all process groups
+        // 2. Remove isolated networks (containers are gone, network is unused)
+        for res in self.resources.iter_mut().rev() {
+            if !res.released
+                && let ResourceKind::Network { name, runtime_bin } = &res.kind
+            {
+                if let Err(msg) = remove_network(runtime_bin, name)
+                    && !msg.to_lowercase().contains("no such network")
+                {
+                    errors.push(format!("failed to remove network {name}: {msg}"));
+                }
+                res.released = true;
+            }
+        }
+
+        // 3. Terminate all process groups
         for res in self.resources.iter_mut().rev() {
             if !res.released
                 && let ResourceKind::ProcessGroup { pgid, .. } = &res.kind
@@ -368,7 +482,7 @@ impl ResourceManager {
             }
         }
 
-        // 3. Remove files
+        // 4. Remove files
         for res in self.resources.iter_mut().rev() {
             if !res.released
                 && let ResourceKind::File { path } = &res.kind
@@ -382,7 +496,7 @@ impl ResourceManager {
             }
         }
 
-        // 4. Remove directories
+        // 5. Remove directories
         for res in self.resources.iter_mut().rev() {
             if !res.released
                 && let ResourceKind::Directory { path } = &res.kind
@@ -399,7 +513,7 @@ impl ResourceManager {
             }
         }
 
-        // 5. Finally remove root dir if empty or owned
+        // 6. Finally remove root dir if empty or owned
         if self.root_dir.exists()
             && let Ok(mut entries) = std::fs::read_dir(&self.root_dir)
             && entries.next().is_none()
@@ -620,6 +734,68 @@ exit 1
         rm2.register_container("badid2", fake.clone());
         let err = rm2.release_all().expect_err("expected container error");
         assert!(err.iter().any(|e| e.contains("badid2")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn network_release_is_idempotent_on_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let base =
+            std::env::temp_dir().join(format!("salvage-network-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let fake = base.join("docker");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh
+echo Error: No such network >&2
+exit 1
+",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(remove_network(&fake, "salvage-net-x").is_ok());
+        let run_id = RunId::new("test-network-missing").unwrap();
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut rm = ResourceManager::new(run_id, root.clone());
+        let rid = rm.register_network("salvage-net-x", fake.clone());
+        assert_eq!(rid, "network:salvage-net-x");
+        assert_eq!(rm.register_network("salvage-net-x", fake.clone()), rid);
+        assert!(rm.release_resource(&rid).is_ok());
+        assert!(rm.release_resource(&rid).is_ok());
+        assert!(rm.release_all().is_ok());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn network_removed_after_containers_on_release_all() {
+        use std::os::unix::fs::PermissionsExt;
+        let base =
+            std::env::temp_dir().join(format!("salvage-network-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let log = base.join("calls.log");
+        let fake = base.join("docker");
+        let script = format!("#!/bin/sh\necho \"$*\" >> {}\nexit 0\n", log.display());
+        std::fs::write(&fake, script).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run_id = RunId::new("test-network-order").unwrap();
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut rm = ResourceManager::new(run_id, root);
+        rm.register_network("salvage-net-order", fake.clone());
+        rm.register_container("abc123", fake.clone());
+        assert!(rm.release_all().is_ok());
+        let logged = std::fs::read_to_string(&log).unwrap_or_default();
+        let container_pos = logged.find("rm -f abc123").expect("container rm logged");
+        let network_pos = logged
+            .find("network rm salvage-net-order")
+            .expect("network rm logged");
+        assert!(
+            container_pos < network_pos,
+            "containers must be removed before networks, got {logged:?}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

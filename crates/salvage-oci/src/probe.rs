@@ -33,12 +33,23 @@ pub fn wait_ready(
         let ready = match readiness {
             AppReadiness::Tcp { host, port } => {
                 let (h, hp) = resolve_target(container, host.as_deref(), *port);
-                tcp_probe_once(&h, hp)
+                if tcp_probe_once(&h, hp) {
+                    true
+                } else {
+                    // Isolated networks (`--internal`, ADR 0004) do not publish
+                    // host ports, so fall back to an in-container check via
+                    // `docker exec` against container loopback.
+                    tcp_probe_via_exec(runtime, container, *port, deadline, cancel)?
+                }
             }
             AppReadiness::Http { host, port, path } => {
                 let (h, hp) = resolve_target(container, host.as_deref(), *port);
                 let p = path.as_deref().unwrap_or("/");
-                http_probe_once(&h, hp, p)
+                if http_probe_once(&h, hp, p) {
+                    true
+                } else {
+                    http_probe_via_exec(runtime, container, *port, p, deadline, cancel)?
+                }
             }
             AppReadiness::Exec { command } => {
                 exec_probe_once(runtime, container, command, deadline, cancel)?
@@ -185,6 +196,57 @@ fn exec_probe_once(
             }
         }
     }
+}
+
+fn tcp_probe_via_exec(
+    runtime: &ContainerRuntime,
+    container: &ContainerHandle,
+    port: i64,
+    deadline: &StageDeadline,
+    cancel: &CancellationToken,
+) -> Result<bool, StageExecutionError> {
+    let cport = port as u16;
+    // Busybox `nc` is the container-local TCP check; missing tool is Ok(false)
+    // so host-side success remains primary for images without `nc`.
+    exec_probe_once(
+        runtime,
+        container,
+        &[
+            "nc".to_owned(),
+            "-z".to_owned(),
+            "-w2".to_owned(),
+            "127.0.0.1".to_owned(),
+            cport.to_string(),
+        ],
+        deadline,
+        cancel,
+    )
+}
+
+fn http_probe_via_exec(
+    runtime: &ContainerRuntime,
+    container: &ContainerHandle,
+    port: i64,
+    path: &str,
+    deadline: &StageDeadline,
+    cancel: &CancellationToken,
+) -> Result<bool, StageExecutionError> {
+    let cport = port as u16;
+    let url = format!("http://127.0.0.1:{cport}{path}");
+    // Busybox `wget` is the container-local HTTP check; missing tool is
+    // Ok(false) so host-side success remains primary elsewhere.
+    exec_probe_once(
+        runtime,
+        container,
+        &[
+            "wget".to_owned(),
+            "-qO-".to_owned(),
+            "--timeout=2".to_owned(),
+            url,
+        ],
+        deadline,
+        cancel,
+    )
 }
 
 fn check_crash(
