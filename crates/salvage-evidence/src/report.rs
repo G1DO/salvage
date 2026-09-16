@@ -28,6 +28,7 @@ pub fn render_html_report(bundle: &EvidenceBundle) -> String {
         VerdictClassification::Verified => ("badge-verified", "VERIFIED"),
         VerdictClassification::VerificationFailed => ("badge-failed", "VERIFICATION FAILED"),
         VerdictClassification::BootFailed => ("badge-failed", "BOOT FAILED"),
+        VerdictClassification::IsolationFailed => ("badge-failed", "ISOLATION FAILED"),
         VerdictClassification::OrchestrationFailed => ("badge-failed", "ORCHESTRATION FAILED"),
         VerdictClassification::CleanupFailed => ("badge-warning", "CLEANUP FAILED"),
         VerdictClassification::TimedOut => ("badge-timeout", "TIMED OUT"),
@@ -212,6 +213,70 @@ pub fn render_html_report(bundle: &EvidenceBundle) -> String {
     };
     let events_count = bundle.events.len();
 
+    // Contracts (O3-4, additive): deterministic table from already-redacted bundle.
+    let contracts_html = if let Some(ref contracts) = bundle.contracts {
+        let mut s = String::new();
+        s.push_str("<table>\n<thead>\n<tr><th>Name</th><th>Kind</th><th>Status</th><th>Detail</th></tr>\n</thead>\n<tbody>\n");
+        for c in contracts {
+            let code = c
+                .code
+                .as_deref()
+                .map(|v| format!(" <code>{}</code>", escape_html(v)))
+                .unwrap_or_default();
+            // Truncate rendered output for readability; full output lives in evidence.json.
+            let snippet: String = c.output.chars().take(512).collect();
+            let ellipsis = if c.output.len() > snippet.len() {
+                "…"
+            } else {
+                ""
+            };
+            let trunc = if c.truncated { " (truncated)" } else { "" };
+            s.push_str(&format!(
+                "<tr><td><code>{}</code></td><td><code>{}</code></td><td><span class=\"status-tag status-{}\">{}</span></td><td><code>{}{}</code>{}{}</td></tr>\n",
+                escape_html(&c.name),
+                escape_html(&c.kind),
+                escape_html(&c.status),
+                escape_html(&c.status),
+                escape_html(&snippet),
+                escape_html(ellipsis),
+                code,
+                escape_html(trunc),
+            ));
+        }
+        s.push_str("</tbody>\n</table>\n");
+        s
+    } else {
+        "<p><em>No contracts recorded (v1/v2 run).</em></p>".to_owned()
+    };
+
+    // Isolation (O3-4, additive).
+    let isolation_html = if let Some(ref iso) = bundle.isolation {
+        let network = iso
+            .network
+            .as_deref()
+            .map(escape_html)
+            .unwrap_or_else(|| "N/A".to_owned());
+        let allow = if iso.allowlist.is_empty() {
+            "deny-all".to_owned()
+        } else {
+            iso.allowlist
+                .iter()
+                .map(|e| format!("<code>{}</code>", escape_html(e)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "<p><strong>Network:</strong> <code>{}</code></p>\n<p><strong>Allowlist:</strong> {}</p>\n<p><strong>Egress probe:</strong> <code>{}</code> allowed=<code>{}</code></p>\n<p><strong>Detail:</strong> {}</p>",
+            network,
+            allow,
+            escape_html(&iso.egress.host),
+            iso.egress.allowed,
+            escape_html(&iso.egress.detail),
+        )
+    } else {
+        "<p><em>No isolation record.</em></p>".to_owned()
+    };
+
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -337,6 +402,16 @@ code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, mono
     </div>
   </div>
 
+  <div class="card" style="margin-bottom: 24px; margin-top: 24px;">
+    <h3>Recovery Contracts</h3>
+    {contracts_html}
+  </div>
+
+  <div class="card" style="margin-bottom: 24px;">
+    <h3>Boot Isolation</h3>
+    {isolation_html}
+  </div>
+
   <div class="footer">
     Generated deterministically by {tool_name} v{tool_version} from canonical JSON recovery evidence.
   </div>
@@ -377,6 +452,8 @@ code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, mono
         classification_str = classification_str,
         verdict_html = verdict_html,
         cleanup_html = cleanup_html,
+        contracts_html = contracts_html,
+        isolation_html = isolation_html,
     )
 }
 
@@ -468,6 +545,45 @@ pub fn render_text_report(bundle: &EvidenceBundle) -> String {
     } else {
         out.push_str("No cleanup record.\n");
     }
+    out.push('\n');
+
+    out.push_str("--- CONTRACTS ---\n");
+    if let Some(ref contracts) = bundle.contracts {
+        for c in contracts {
+            let code = c.code.as_deref().unwrap_or("-");
+            let snippet: String = c.output.chars().take(256).collect();
+            out.push_str(&format!(
+                "* {:<20} {:<6} {:<10} {} {}\n",
+                c.name, c.kind, c.status, code, snippet
+            ));
+        }
+    } else {
+        out.push_str("No contracts recorded (v1/v2 run).\n");
+    }
+    out.push('\n');
+
+    out.push_str("--- ISOLATION ---\n");
+    if let Some(ref iso) = bundle.isolation {
+        out.push_str(&format!(
+            "Network:          {}\n",
+            iso.network.as_deref().unwrap_or("N/A")
+        ));
+        out.push_str(&format!(
+            "Allowlist:        {}\n",
+            if iso.allowlist.is_empty() {
+                "deny-all".to_owned()
+            } else {
+                iso.allowlist.join(", ")
+            }
+        ));
+        out.push_str(&format!(
+            "Egress:           {} allowed={}\n",
+            iso.egress.host, iso.egress.allowed
+        ));
+        out.push_str(&format!("Detail:           {}\n", iso.egress.detail));
+    } else {
+        out.push_str("No isolation record.\n");
+    }
 
     out
 }
@@ -521,6 +637,8 @@ mod tests {
                 status: "passed".to_owned(),
                 duration_ms: Some(2500),
             }],
+            contracts: None,
+            isolation: None,
             verdict: Some(VerdictEvidence {
                 verdict: "passed".to_owned(),
                 stage: None,

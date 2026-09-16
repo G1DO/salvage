@@ -201,6 +201,31 @@ impl SecretRedactor {
                 *ver = self.redact_text(ver);
             }
         }
+
+        // Redact contract results (attacker-influenced SQL output / HTTP body /
+        // exec stdout+stderr). Must run before persist AND before display.
+        if let Some(ref mut contracts) = bundle.contracts {
+            for c in contracts.iter_mut() {
+                c.name = self.redact_text(&c.name);
+                c.kind = self.redact_text(&c.kind);
+                c.output = self.redact_text(&c.output);
+                if let Some(ref mut code) = c.code {
+                    *code = self.redact_text(code);
+                }
+            }
+        }
+
+        // Redact isolation block (probe detail is attacker-influenced).
+        if let Some(ref mut isolation) = bundle.isolation {
+            if let Some(ref mut network) = isolation.network {
+                *network = self.redact_text(network);
+            }
+            for entry in isolation.allowlist.iter_mut() {
+                *entry = self.redact_text(entry);
+            }
+            isolation.egress.host = self.redact_text(&isolation.egress.host);
+            isolation.egress.detail = self.redact_text(&isolation.egress.detail);
+        }
     }
 }
 
