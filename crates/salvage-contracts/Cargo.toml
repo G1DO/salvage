@@ -1,0 +1,10 @@
+[package]
+name = "salvage-contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+salvage-core = { path = "../salvage-core" }
+salvage-evidence = { path = "../salvage-evidence" }
+libc = "0.2"

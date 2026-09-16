@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/salvage-cli",
+    "crates/salvage-contracts",
     "crates/salvage-core",
     "crates/salvage-evidence",
     "crates/salvage-postgres",
