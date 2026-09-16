@@ -48,6 +48,39 @@ fn ensure_tiny_image() -> Option<(String, String)> {
     Some((tag.to_string(), id))
 }
 
+fn assert_no_leaked_container(run_id_str: &str) {
+    let ps = run_docker(&[
+        "ps",
+        "-a",
+        "--filter",
+        &format!("name=salvage-{run_id_str}"),
+        "--format",
+        "{{.ID}}",
+    ])
+    .unwrap_or_default();
+    assert!(
+        ps.trim().is_empty(),
+        "zero leak: expected no containers for run, got {ps:?}",
+    );
+}
+
+fn assert_no_leaked_network(run_id_str: &str) {
+    let net = format!("salvage-net-{run_id_str}");
+    let ls = run_docker(&[
+        "network",
+        "ls",
+        "--filter",
+        &format!("name={net}"),
+        "--format",
+        "{{.Name}}",
+    ])
+    .unwrap_or_default();
+    assert!(
+        ls.trim().is_empty(),
+        "zero leak: expected no network {net:?}, got {ls:?}",
+    );
+}
+
 fn tiny_manifest(digest: &str) -> ManifestV2 {
     let json = format!(
         r#"{{
@@ -99,19 +132,45 @@ fn tiny_http_boot_happy_path() {
         exec.observed_artifact_digest.is_some(),
         "telemetry digest must be populated"
     );
-    let ps = run_docker(&[
-        "ps",
-        "--filter",
-        &format!("name=salvage-{}", run_id_str),
-        "--format",
-        "{{.ID}}",
-    ])
-    .unwrap_or_default();
-    assert!(
-        ps.trim().is_empty(),
-        "zero leak: expected no containers for run, got {:?}",
-        ps
-    );
+    assert_no_leaked_container(&run_id_str);
+    assert_no_leaked_network(&run_id_str);
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[test]
+#[ignore]
+fn isolated_network_denies_forbidden_egress() {
+    // O3-3: deny-all `--internal` network must block the fake prod host, the
+    // boot still passes (blocked is `allowed:false`, not a failure), and
+    // container + network are removed on the pass path. The reachable case
+    // (`isolation/egress-allowed`) is covered by unit tests with a test
+    // double that forces `docker exec` exit 0.
+    if std::env::var("SALVAGE_TEST_DOCKER").as_deref() != Ok("1") {
+        eprintln!("skipping: set SALVAGE_TEST_DOCKER=1 to run docker boot E2E");
+        return;
+    }
+    let rt = ContainerRuntime::discover().expect("docker must be available");
+    assert!(rt.major >= 24, "docker >=24 required");
+    let (_tag, digest) = ensure_tiny_image().expect("tiny image build must succeed");
+    let manifest = tiny_manifest(&digest);
+    let app = manifest.app.clone();
+    let limits = manifest.limits.clone();
+    let run_id = RunId::new(format!("oci-iso-{}", std::process::id())).expect("run id");
+    let run_id_str = run_id.as_str().to_owned();
+    let run_dir = std::env::temp_dir().join(format!("salvage-oci-iso-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&run_dir);
+    let config = RunConfig::new(run_id, run_dir.clone());
+    let mut exec = OciBootExecutor::new(app, limits);
+    let outcome = RunEngine::start_run_v2(config, manifest, &mut exec).expect("run must complete");
+    match &outcome.verdict {
+        Verdict::Passed => {}
+        Verdict::Failed { stage, code, .. } => panic!(
+            "deny-all must block forbidden egress without failing, got Failed{{stage:{stage}, code:{code}}}",
+        ),
+        other => panic!("expected Passed under deny-all, got {other:?}"),
+    }
+    assert_no_leaked_container(&run_id_str);
+    assert_no_leaked_network(&run_id_str);
     let _ = std::fs::remove_dir_all(&run_dir);
 }
 

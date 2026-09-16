@@ -143,6 +143,7 @@ name = "salvage-oci"
 version = "0.1.0"
 dependencies = [
  "salvage-core",
+ "salvage-evidence",
  "salvage-postgres",
  "serde",
  "serde_json",
