@@ -474,6 +474,21 @@ impl StageExecutor for V3Executor {
         let exec_opts = ExecOptions::none();
         let mut out = Vec::with_capacity(contracts.len());
         for c in contracts {
+            // O4-1: contracts run for operator-visible wall-clock time, so the
+            // stage honors cancellation and the global deadline at every
+            // contract boundary (mid-contract SIGINT/SIGTERM is preempted
+            // inside the exec poll loop; hung sql/http stay bounded by their
+            // `timeout_ms`). Without these checks a signal during contracts
+            // would be silently ignored and the run could still verify.
+            if ctx.cancellation_token.is_cancelled() {
+                return Err(StageExecutionError::cancelled(
+                    ctx.cancellation_token.cancellation_signal(),
+                    "contracts cancelled before contract started",
+                ));
+            }
+            if ctx.deadline.is_expired() {
+                return Err(StageExecutionError::TimedOut);
+            }
             // Socket dir is per-contract (ephemeral cluster); http/exec ignore it.
             let socket = self
                 .postgres
@@ -491,6 +506,15 @@ impl StageExecutor for V3Executor {
                 duration_ms: Some(result.duration_ms),
                 rows: result.rows,
             });
+            if ctx.cancellation_token.is_cancelled() {
+                return Err(StageExecutionError::cancelled(
+                    ctx.cancellation_token.cancellation_signal(),
+                    "contracts cancelled during contract execution",
+                ));
+            }
+            if ctx.deadline.is_expired() {
+                return Err(StageExecutionError::TimedOut);
+            }
         }
         Ok(out)
     }
@@ -645,7 +669,17 @@ fn salvage_run(opts: RunOptions) -> (i32, String) {
         None => std::env::temp_dir().join(format!("salvage-run-{run_id}")),
     };
 
-    let config = RunConfig::new(run_id.clone(), run_dir);
+    let mut config = RunConfig::new(run_id.clone(), run_dir);
+    // O4-1: test-only global-deadline injector. Mirrors the
+    // `SALVAGE_TEST_RESTORE_DELAY_MS` precedent in salvage-postgres: never set
+    // in production, only read here so the fault matrix can force a deterministic
+    // global `timed-out` verdict without changing the manifest schema or CLI flags.
+    if let Ok(timeout_str) = std::env::var("SALVAGE_TEST_GLOBAL_TIMEOUT_MS")
+        && let Ok(timeout_ms) = timeout_str.parse::<u64>()
+        && timeout_ms > 0
+    {
+        config.global_timeout = Some(std::time::Duration::from_millis(timeout_ms));
+    }
     let expected_name = opts
         .expected_table
         .clone()
