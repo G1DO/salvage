@@ -538,6 +538,24 @@ impl ContractExecutor {
                     );
                 }
                 Ok(None) => {
+                    if salvage_core::lifecycle::cancellation::interrupt_requested() {
+                        // O4-1: operator interrupt (SIGINT/SIGTERM) preempts a
+                        // hung exec contract promptly. The timeout-shaped
+                        // result is discarded: the caller observes the
+                        // cancellation token after each contract and maps an
+                        // interrupted run to `Cancelled`.
+                        let _ =
+                            salvage_core::lifecycle::terminate_process_group(pgid, TERMINATE_GRACE);
+                        let _ = child.wait();
+                        return with_pid(
+                            ContractResult::timed_out(
+                                name,
+                                KIND,
+                                start.elapsed().as_millis() as u64,
+                            ),
+                            pid,
+                        );
+                    }
                     if start.elapsed() >= timeout {
                         let _ =
                             salvage_core::lifecycle::terminate_process_group(pgid, TERMINATE_GRACE);

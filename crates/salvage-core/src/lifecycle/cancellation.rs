@@ -30,6 +30,16 @@ pub fn reset_signal_state() {
     GLOBAL_SIGNAL_NUM.store(0, Ordering::SeqCst);
 }
 
+/// Returns true when an OS interrupt (`SIGINT`/`SIGTERM`) arrived via the
+/// process-wide handler.
+///
+/// O4-1: lets leaf poll loops (e.g. the exec contract runner) preempt a hung
+/// child promptly without taking a token parameter. Stage verdict mapping
+/// stays with the caller, which observes the [`CancellationToken`].
+pub fn interrupt_requested() -> bool {
+    GLOBAL_SIGNAL_FLAG.load(Ordering::SeqCst)
+}
+
 /// A thread-safe token for propagating cancellation across stages and background tasks.
 #[derive(Debug, Clone)]
 pub struct CancellationToken {
