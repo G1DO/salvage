@@ -80,9 +80,11 @@ filesystem-`ENOSPC` (O4-3), reachable-egress E2E (O4-4). See #45.
 
 ## Consequences
 
-- O4-1 closes when the matrix is green locally (8/8, ~25 s) + CI green
-  with Docker tests ignored by default.
-- CI cost: ~1 min extra (8 rows × ~25 s ÷ 2 threads × 2 repeats).
+- O4-1 closes when the matrix is green locally (8/8 at O4-1 merge, ~25 s;
+  9/9 with O4-2's missing-role row) + CI green with Docker tests ignored
+  by default.
+- CI cost: ~1 min extra (8 rows × ~25 s ÷ 2 threads × 2 repeats at O4-1
+  merge; grows by one row in O4-2).
 - Known limitation: cancellation during a hung `sql`/`http` contract takes
   effect at the contract boundary (bounded by `timeout_ms`); only `exec`
   preempts mid-contract today.
