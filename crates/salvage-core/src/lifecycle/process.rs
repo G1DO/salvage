@@ -34,6 +34,15 @@ impl ProcessHandle {
         self.child.wait()
     }
 
+    /// Takes the piped stderr handle, if still held.
+    ///
+    /// O4-2: lets callers drain diagnostics after the child exits so
+    /// `pg_restore` failures can be classified (missing role vs extension
+    /// vs corrupt backup) instead of collapsing into a single code.
+    pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+
     /// Gracefully terminates the entire process group and reaps the child process.
     pub fn terminate(&mut self, grace_period: Duration) -> std::io::Result<ExitStatus> {
         terminate_and_reap_child(&mut self.child, self.pgid, grace_period)

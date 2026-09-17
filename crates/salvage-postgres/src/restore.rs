@@ -186,8 +186,18 @@ pub fn execute_restore(
                 if status.success() {
                     return Ok(start.elapsed());
                 } else {
-                    // Extract diagnostic from pg_restore exit status
-                    return Err(classify_restore_exit_status(status.code()));
+                    // O4-2: drain stderr after exit so the failure can be
+                    // classified (missing role/extension vs corrupt backup).
+                    // Volumes are small (a handful of error lines); if output
+                    // ever filled the pipe the child would already be stuck
+                    // and this stage would time out, so post-exit read adds
+                    // no new failure mode.
+                    let mut stderr_text = String::new();
+                    if let Some(mut stderr) = handle.take_stderr() {
+                        let _ = stderr.read_to_string(&mut stderr_text);
+                    }
+                    // Extract diagnostic from pg_restore exit status + stderr
+                    return Err(classify_restore_exit_status(status.code(), &stderr_text));
                 }
             }
             Ok(None) => {
@@ -203,7 +213,53 @@ pub fn execute_restore(
     }
 }
 
-fn classify_restore_exit_status(code: Option<i32>) -> StageExecutionError {
+/// Classifies a non-zero `pg_restore` exit using its captured stderr.
+///
+/// O4-2: a missing role or extension is an environment mismatch, not a
+/// corrupt backup, and operators need the difference to act (create the
+/// role / install the extension vs distrust the artifact). Anything else
+/// keeps the historical `restore/corrupt-backup` code. Fragments below are
+/// the real server message shapes, verified against PostgreSQL 16
+/// (`role "x" does not exist` from `ALTER ... OWNER TO`; `could not open
+/// extension control file` from `CREATE EXTENSION` with absent files;
+/// `extension "x" does not exist` from `ALTER EXTENSION`).
+fn classify_restore_exit_status(code: Option<i32>, stderr: &str) -> StageExecutionError {
+    const MAX_EXCERPT_CHARS: usize = 300;
+    let excerpt = |line: &str| {
+        let short: String = line.chars().take(MAX_EXCERPT_CHARS).collect();
+        if line.chars().count() > MAX_EXCERPT_CHARS {
+            format!("{short}…")
+        } else {
+            short
+        }
+    };
+    let role_line = stderr.lines().map(str::trim).find(|line| {
+        let lowered = line.to_lowercase();
+        lowered.contains("role \"") && lowered.contains("\" does not exist")
+    });
+    if let Some(line) = role_line {
+        return StageExecutionError::failed(
+            "restore/missing-role",
+            format!(
+                "pg_restore failed: environment role is missing ({}); pg_restore exit code: {code:?}",
+                excerpt(line),
+            ),
+        );
+    }
+    let extension_line = stderr.lines().map(str::trim).find(|line| {
+        let lowered = line.to_lowercase();
+        lowered.contains("could not open extension control file")
+            || (lowered.contains("extension \"") && lowered.contains("\" does not exist"))
+    });
+    if let Some(line) = extension_line {
+        return StageExecutionError::failed(
+            "restore/missing-extension",
+            format!(
+                "pg_restore failed: environment extension is missing ({}); pg_restore exit code: {code:?}",
+                excerpt(line),
+            ),
+        );
+    }
     StageExecutionError::failed(
         "restore/corrupt-backup",
         format!("pg_restore terminated with non-zero exit code: {code:?}"),
@@ -269,4 +325,73 @@ pub fn verify_structural_integrity(
     }
 
     Ok(tables)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed_code(err: &StageExecutionError) -> &str {
+        match err {
+            StageExecutionError::Failed { code, .. } => code,
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_role_from_owner_reassignment() {
+        // Real pg_restore shape (PostgreSQL 16, verified live in O4-2).
+        let stderr = "pg_restore: error: could not execute query: ERROR:  role \"phantom_salvage\" does not exist\n\
+             Command was: ALTER TABLE public.salvage_records OWNER TO phantom_salvage;\n\
+             pg_restore: warning: errors ignored on restore: 2\n";
+        let err = classify_restore_exit_status(Some(1), stderr);
+        assert_eq!(failed_code(&err), "restore/missing-role");
+        assert!(format!("{err:?}").contains("phantom_salvage"));
+    }
+
+    #[test]
+    fn missing_extension_from_absent_control_file() {
+        // Real server shape for CREATE EXTENSION with missing files.
+        let stderr = "pg_restore: error: could not execute query: ERROR:  extension \"postgis\" is not available\n\
+             DETAIL:  Could not open extension control file \"/usr/share/postgresql/16/extension/postgis.control\": No such file or directory.\n";
+        let err = classify_restore_exit_status(Some(1), stderr);
+        assert_eq!(failed_code(&err), "restore/missing-extension");
+    }
+
+    #[test]
+    fn missing_extension_from_alter_unknown_name() {
+        let stderr = "pg_restore: error: could not execute query: ERROR:  extension \"postgis\" does not exist\n";
+        let err = classify_restore_exit_status(Some(1), stderr);
+        assert_eq!(failed_code(&err), "restore/missing-extension");
+    }
+
+    #[test]
+    fn unrelated_failure_keeps_corrupt_backup() {
+        // Historical behavior preserved: anything else stays corrupt-backup.
+        let stderr = "pg_restore: error: unrecognized data block type (42) in archive\n";
+        let err = classify_restore_exit_status(Some(1), stderr);
+        assert_eq!(failed_code(&err), "restore/corrupt-backup");
+    }
+
+    #[test]
+    fn empty_stderr_and_killed_process_stay_corrupt_backup() {
+        assert_eq!(
+            failed_code(&classify_restore_exit_status(Some(1), "")),
+            "restore/corrupt-backup"
+        );
+        assert_eq!(
+            failed_code(&classify_restore_exit_status(None, "")),
+            "restore/corrupt-backup"
+        );
+    }
+
+    #[test]
+    fn role_match_requires_both_fragments_on_one_line() {
+        // `role "` on one line and `" does not exist` on another must not
+        // match: prevents cross-line false positives from wrapped output.
+        let stderr = "pg_restore: note: role \"app\" owns objects\n\
+             pg_restore: error: something \"important\" does not exist\n";
+        let err = classify_restore_exit_status(Some(1), stderr);
+        assert_eq!(failed_code(&err), "restore/corrupt-backup");
+    }
 }
