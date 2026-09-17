@@ -359,8 +359,19 @@ exit 1
 
     #[test]
     fn digest_mismatch_without_repository_is_fail_closed() {
-        let base =
-            std::env::temp_dir().join(format!("salvage-image-norepo-{}", std::process::id()));
+        // Unique per run (pid + nanos), not just pid: two processes must
+        // never share a fake-runtime dir, and a stale dir from a killed run
+        // must not be mistaken for this run's. The assertion keeps the
+        // spawn/wait message so the next environment flake is diagnosable
+        // instead of code-only (see main CI flake 2026-09-17, green on rerun).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "salvage-image-norepo-{}-{nanos}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let fake = make_always_fail_bin(&base);
@@ -377,7 +388,9 @@ exit 1
         let cancel = CancellationToken::new();
         let err = ensure_image(&rt, &app, &mut rm, &deadline, &cancel).expect_err("must fail");
         match err {
-            StageExecutionError::Failed { code, .. } => assert_eq!(code, "app/digest-mismatch"),
+            StageExecutionError::Failed { code, message } => {
+                assert_eq!(code, "app/digest-mismatch", "message was: {message}")
+            }
             other => panic!("unexpected {:?}", other),
         }
         let _ = std::fs::remove_dir_all(&base);
