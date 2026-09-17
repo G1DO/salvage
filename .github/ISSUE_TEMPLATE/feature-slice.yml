@@ -10,13 +10,6 @@ body:
     validations:
       required: true
   - type: input
-    id: owner
-    attributes:
-      label: Owner
-      description: One accountable person
-    validations:
-      required: false
-  - type: input
     id: outcome
     attributes:
       label: Parent outcome
@@ -26,10 +19,10 @@ body:
   - type: textarea
     id: scope
     attributes:
-      label: Scope / non-goals
-      description: In scope, deliberately out of scope, constraints (compat, perf, security)
+      label: Scope / constraints
+      description: Add boundaries, non-goals, or compat/perf/security constraints only when they help interpretation
     validations:
-      required: true
+      required: false
   - type: textarea
     id: acceptance
     attributes:
