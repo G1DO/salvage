@@ -12,6 +12,7 @@
 //! | truncated backup | `corrupt-truncated.dump` + matching digest | `restore/corrupt-backup` | `orchestration-failed` |
 //! | wrong declared DB version | `postgres.version = "99.0"` | `restore/unsupported-version` | `orchestration-failed` |
 //! | wrong app version | zeroed `app.digest` pin | `app/digest-mismatch` | `boot-failed` |
+//! | missing role | owner absent from fresh target (`missing-role.dump`) | `restore/missing-role` | `orchestration-failed` |
 //! | malformed contract | disallowed `argv[0]` (`rm`, never spawned) | `contract/malformed` | `verification-failed` |
 //! | oversized contract | 70 KiB HTTP body vs 64 KiB cap | `contract/oversized` | `verification-failed` |
 //! | evidence-write failure | `evidence.destination = file:///dev/full` (Linux) | `evidence/write-failed` | `verification-failed` |
@@ -28,11 +29,12 @@
 //! only (no `http` contract, so no local server is needed), the digest pin is
 //! local, and `/dev/full` is a kernel-guaranteed `ENOSPC`-class writer.
 //!
-//! Deliberately deferred to later O4 slices (see #45): missing
-//! role/extension distinct codes (needs `pg_restore` stderr classification),
-//! true filesystem-`ENOSPC` (shares the `evidence/write-failed` path covered
-//! here), and reachable-egress E2E (needs a responder outside the isolated
-//! net).
+//! Deliberately deferred to later O4 slices (see #45): missing extension
+//! at E2E (classifier unit-tested with real message shapes; a deterministic
+//! fixture needs a multi-extension toolchain — the committed dumps carry no
+//! extension entries to diverge, see ADR 0008), true filesystem-`ENOSPC`
+//! (shares the `evidence/write-failed` path covered here), and
+//! reachable-egress E2E (needs a responder outside the isolated net).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -425,6 +427,53 @@ fn wrong_declared_db_version_full_slice() {
             &run_id,
             &run_dir,
         );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}
+
+#[test]
+#[ignore]
+fn missing_role_full_slice() {
+    if !require_docker() {
+        return;
+    }
+    // sha256 of tests/fixtures/missing-role.dump: an object owned by
+    // `phantom_salvage`, absent from the fresh target, so restore fails with
+    // `restore/missing-role` (not `restore/corrupt-backup`) while the table
+    // itself restores fine. No image needed: the fault fires in restore.
+    const ROLE_DUMP_DIGEST: &str =
+        "sha256:7b506c8151760de443fc02ca6688d6bdb2928ec2574038a6cb296696d2c2b82a";
+    for _ in 0..matrix_repeats() {
+        let tmp = unique_temp_dir("missing-role");
+        let manifest_path = write_v3_fault(
+            "sha256:e22a313ea41b0ce4bc1919997a651a41fc0ae71eaf7d605bc2cbfd03e0a32cb8",
+            Some(ROLE_DUMP_DIGEST),
+            None,
+            None,
+            None,
+            None,
+            &tmp,
+        );
+        let dump_dst = tmp.join("backup.dump");
+        fs::copy(fixture_path("missing-role.dump"), &dump_dst).unwrap();
+        let run_dir = tmp.join("run");
+        let run_id = unique_run_id("role");
+
+        let start = Instant::now();
+        let out = run_salavage(&manifest_path, &dump_dst, &run_dir, &run_id, &[]);
+        let elapsed = start.elapsed().as_secs();
+        assert_failed_run(
+            &out,
+            elapsed,
+            "restore/missing-role",
+            "orchestration-failed",
+            180,
+            &run_id,
+            &run_dir,
+        );
+        // The operator-actionable role name must reach the result message.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("phantom_salvage"), "{stderr}");
         let _ = fs::remove_dir_all(&tmp);
     }
 }
