@@ -8,14 +8,14 @@ Current implemented truth. Code is canonical; this file links it.
 - `crates/salvage-core`: manifest + lifecycle/domain. Manifest spec `crates/salvage-core/src/manifest.rs:1-79`. Lifecycle spec `crates/salvage-core/src/lifecycle/mod.rs:1-52`.
 - `crates/salvage-postgres`: PostgreSQL adapter boundary. Preflight + restore `crates/salvage-postgres/src/restore.rs:20-60`.
 - `crates/salvage-evidence`: canonical evidence schema + deterministic projections. `crates/salvage-evidence/src/lib.rs:1-6`, `bundle.rs`.
-- `crates/salvage-oci`: OCI boot executor (v2 only) with default-deny isolation (O3-3). Policy `crates/salvage-oci/src/isolation.rs`, decision `docs/decisions/0004-boot-isolation-default-deny.md`.
-- `crates/salvage-contracts`: recovery contract executor core (O3-2, bounded + classified, not yet wired to CLI/evidence). Types `crates/salvage-contracts/src/outcome.rs`, caps `crates/salvage-contracts/src/caps.rs`, runners `crates/salvage-contracts/src/executor.rs`.
+- `crates/salvage-oci`: OCI boot executor (v2/v3) with default-deny isolation (O3-3). Policy `crates/salvage-oci/src/isolation.rs`, decision `docs/decisions/0004-boot-isolation-default-deny.md`.
+- `crates/salvage-contracts`: recovery contract executor (O3-2 core, O3-4 wired to CLI/evidence). Types `crates/salvage-contracts/src/outcome.rs`, caps `crates/salvage-contracts/src/caps.rs`, runners `crates/salvage-contracts/src/executor.rs`, production backends `crates/salvage-cli/src/main.rs:261-412` (`V3Executor`).
 
 ## Run lifecycle
 
-`Planning → Validating → Restoring → Verifying → (Booting →) Terminal(Verdict) → Cleaning → Cleaned`
+`Planning → Validating → Restoring → Verifying → (Booting → Contracts →) Terminal(Verdict) → Cleaning → Cleaned`
 
-- v1 short-circuits `Verifying → Terminal`. v2 runs `Booting` after verification via `RunEngine::start_run_v2` with `deadlines.boot_seconds`.
+- v1 short-circuits `Verifying → Terminal`. v2 runs `Booting` after verification via `RunEngine::start_run_v2` with `deadlines.boot_seconds`. v3 runs `Booting` then `Contracts` via `RunEngine::start_run_v3` (`Stage::Contracts`, journaled + `contracts` stage timing); health/readiness alone can never verify.
 - `RunOutcome` keeps primary `Verdict` separate from `CleanupStatus`; cleanup failure never masks root cause.
 - Resources (`OwnedResource` + `RunId`) are scoped per-run; cleanup is reverse-order, idempotent. Order: containers, then isolated networks (`Network{name}`, `docker network rm`), then process groups, files, dirs. Safe re-entry via `StaleResources` / `AlreadyExists`.
 - Processes run in isolated groups (`PGID == PID`); `SIGTERM → SIGKILL` broadcast + reap on timeout/cancel.
@@ -37,14 +37,19 @@ Current implemented truth. Code is canonical; this file links it.
 
 ## Evidence
 
-- `evidence.json` (v1) is canonical; `report.html`/text are deterministic projections. Non-deterministic fields excluded from golden comparison (run_id, timestamps, durations).
-- `Verdict`: `verified` | `verification-failed` | `boot-failed` | `orchestration-failed` | `cleanup-failed` | `timed-out` | `cancelled` | `incomplete`. `completeness`: `complete` vs `incomplete`.
-- `SecretRedactor` strips credentials/connection strings/keys/headers before persistence/projection.
+- `evidence.json` (v1) is canonical; `report.html`/text are deterministic projections. Non-deterministic fields excluded from golden comparison (run_id, timestamps, durations, `contracts[].duration_ms`).
+- `Verdict`: `verified` | `verification-failed` | `boot-failed` | `isolation-failed` | `orchestration-failed` | `cleanup-failed` | `timed-out` | `cancelled` | `incomplete`. `completeness`: `complete` vs `incomplete`.
+- `Verified` requires: stage `Passed` AND (`contracts == None` legacy v1/v2 OR `Some` non-empty all `passed` with no `code`) AND no isolation failure. Contract `contract/...` failures map to `verification-failed`; `isolation/...` maps to `isolation-failed` (dominates). See `docs/decisions/0005-evidence-contracts-isolation-verdict.md`.
+- `SecretRedactor` strips credentials/connection strings/keys/headers before persistence/projection, including `contracts[].{name,kind,output,code}` and `isolation.{network,allowlist,egress.*}`.
 
-## Recovery contracts (O3-2 core, unwired)
+## Recovery contracts (v3, wired O3-4, proven O3-5)
 
-- Declared in `v3` manifests (`contracts[]`, see `crates/salvage-core/src/manifest.rs:80-96`); executed by `ContractExecutor` against the booted artifact with per-contract `timeout_ms` budgets.
-- Result taxonomy: `passed` | `failed` | `timed-out` plus one `contract/*` code (`contract/timeout`, `contract/malformed`, `contract/oversized`, `contract/crash`, `contract/assert-failed`).
-- Caps: output bytes (default 64 KiB), rows (default 1000), duration (`timeout_ms`), argv allowlist, no shell. `sql` handles are Unix-socket-only (no TCP param). Output is truncated to caps and passed through `SecretRedactor` before assert/persist.
-- `sql`/`http` run through injected backends (unit fakes; no Docker, no PG, no real sockets in tests). `exec` spawns real children in isolated groups; timeout kills the group (`SIGTERM → SIGKILL` + reap, pid reported for leak asserts).
-- Out of scope here: network policy, evidence schema change, CLI wiring, Docker E2E (later O3 slices).
+| Kind | Protocol | Limits | Failure codes |
+|---|---|---|---|
+| `sql` | `psql -h <unix-socket> -U postgres -d <restored>` with declared `query`; socket-only, no TCP param | per-contract `timeout_ms` `1..=300000`, output 64 KiB, rows 1000 | `contract/timeout`, `contract/malformed` (blank/spec mismatch), `contract/crash` (spawn/panic), `contract/oversized`, `contract/assert-failed` (0 rows) |
+| `http` | minimal blocking HTTP/1.0 over `TcpStream`, no redirects; `http://` only — `https://` fails closed as `contract/crash` (no TLS deps) | same `timeout_ms` + 64 KiB body cap | `contract/timeout`, `contract/malformed` (non-`http(s)`/bad host), `contract/crash` (DNS/connect/read, incl. https), `contract/oversized`, `contract/assert-failed` (non-2xx) |
+| `exec` | real child, no shell (`Command::new(argv0)`), isolated process group, `SIGTERM → SIGKILL` + reap on timeout | same `timeout_ms` + 64 KiB cap, argv allowlist (`true,false,echo,sleep,pg_isready,psql,cat`, basename-matched, shells absent) | `contract/timeout` (group killed, pid reported), `contract/malformed` (empty/blank/not-allowlisted, no spawn), `contract/crash` (spawn fail/non-zero exit), `contract/oversized`, `contract/assert-failed` |
+
+- Declared in `v3` manifests (`contracts[]` 1..=32, unique names, `crates/salvage-core/src/manifest.rs`); executed by `ContractExecutor` (`crates/salvage-contracts/src/executor.rs`) after boot via `V3Executor::execute_contracts` (`crates/salvage-cli/src/main.rs:457-496`). Output is truncated to caps and passed through `SecretRedactor` (with env secrets) before assert/persist/display.
+- Isolation default-deny: per-run `salvage-net-<run-id>` `--internal` (no egress, allowlist validated but still denied); forbidden probe `prod-forbidden.invalid` (`.invalid` RFC 2606, no external net) blocked → `allowed:false`, reachable → `isolation/egress-allowed`, missing tools/spawn failure → `isolation/policy-failed` fail-closed, never `bridge`. Block recorded as `isolation{network,allowlist,egress}` in evidence; `docker ps` + `docker network ls` clean on every verdict.
+- E2E matrix (O3-5, `crates/salvage-cli/tests/e2e_contracts.rs`, `#[ignore]` + `SALVAGE_TEST_DOCKER=1`): happy-verified (PG16 dump + tiny-http + SQL + local-HTTP + exec), forbidden-egress, hang/crash, redaction canary. Fixture `tests/fixtures/manifest-valid-v3-e2e.json` (local `http://127.0.0.1:8000/` + `egress_allow ["127.0.0.1"]`). CI runs unit + opt-in Docker matrix and uploads `recovery-evidence` (v1) + `recovery-evidence-v3` (contracts + isolation). See `docs/decisions/0006-e2e-matrix-contracts-isolation.md`.

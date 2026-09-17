@@ -55,6 +55,27 @@ jobs:
           SALVAGE_TEST_DOCKER=1 cargo test --test e2e_boot --locked -- --ignored
           SALVAGE_TEST_DOCKER=1 cargo test -p salvage-oci --test boot_integration --locked -- --ignored
 
+      - name: Run Docker E2E contracts matrix (O3-5)
+        run: |
+          SALVAGE_TEST_DOCKER=1 cargo test --test e2e_contracts --locked -- --ignored
+
+      - name: Run v3 contracts drill and generate evidence bundle
+        run: |
+          docker build -t salvage-tiny-http:test tests/fixtures/images/tiny-http
+          DIGEST=$(docker image inspect salvage-tiny-http:test --format '{{.Id}}')
+          HEX=${DIGEST#sha256:}
+          sed "s/e22a313ea41b0ce4bc1919997a651a41fc0ae71eaf7d605bc2cbfd03e0a32cb8/${HEX}/" \
+            tests/fixtures/manifest-valid-v3-e2e.json > /tmp/manifest-v3-e2e.json
+          python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
+          HTTP_PID=$!
+          trap 'kill $HTTP_PID || true' EXIT
+          cargo run -p salvage-cli --locked -- run /tmp/manifest-v3-e2e.json \
+            --backup tests/fixtures/valid-pg16-custom.dump \
+            --run-dir target/recovery-evidence-v3
+          ls -la target/recovery-evidence-v3/
+          kill $HTTP_PID
+          trap - EXIT
+
       - name: Upload recovery evidence bundle
         uses: actions/upload-artifact@v7
         with:
@@ -64,5 +85,9 @@ jobs:
             target/recovery-evidence/report.html
             target/recovery-evidence/journal.jsonl
             target/recovery-evidence/state.json
+            target/recovery-evidence-v3/evidence.json
+            target/recovery-evidence-v3/report.html
+            target/recovery-evidence-v3/journal.jsonl
+            target/recovery-evidence-v3/state.json
           if-no-files-found: error
 
