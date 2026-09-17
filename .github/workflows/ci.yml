@@ -59,6 +59,10 @@ jobs:
         run: |
           SALVAGE_TEST_DOCKER=1 cargo test --test e2e_contracts --locked -- --ignored
 
+      - name: Run Docker E2E fault matrix (O4-1)
+        run: |
+          SALVAGE_TEST_DOCKER=1 SALVAGE_FAULT_MATRIX_REPEATS=2 cargo test --test e2e_faults --locked -- --ignored
+
       - name: Run v3 contracts drill and generate evidence bundle
         run: |
           docker build -t salvage-tiny-http:test tests/fixtures/images/tiny-http
