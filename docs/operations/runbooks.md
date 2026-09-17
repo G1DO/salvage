@@ -65,6 +65,7 @@ salvage evidence check target/recovery-evidence-v3/evidence.json
 # Full-slice faults with expected verdicts (opt-in Docker, ignored by default):
 SALVAGE_TEST_DOCKER=1 cargo test --test e2e_faults --locked -- --ignored
 # corrupt backup => restore/corrupt-backup; wrong DB version => restore/unsupported-version
+# missing role (phantom owner) => restore/missing-role; missing extension => restore/missing-extension
 # wrong app digest => app/digest-mismatch + boot-failed
 # disallowed argv0 => contract/malformed; 70 KiB HTTP body => contract/oversized
 # destination file:///dev/full => evidence/write-failed (Linux)
