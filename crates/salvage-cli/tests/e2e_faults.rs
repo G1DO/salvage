@@ -17,7 +17,7 @@
 //! | oversized contract | 70 KiB HTTP body vs 64 KiB cap | `contract/oversized` | `verification-failed` |
 //! | evidence-write failure | `evidence.destination = file:///dev/full` (Linux) | `evidence/write-failed` | `verification-failed` |
 //! | SIGTERM mid-contracts | `SIGTERM` while an `exec sleep` contract runs | `cancelled` | `cancelled` |
-//! | global deadline expiry | `SALVAGE_TEST_GLOBAL_TIMEOUT_MS` + restore delay hook | `timed-out` | `timed-out` |
+//! | global deadline expiry | `SALVAGE_TEST_GLOBAL_TIMEOUT_MS` + restore delay hook | `timeout` (code; verdict is `timed-out`) | `timed-out` |
 //!
 //! Every row additionally asserts: bounded wall-clock, evidence bundle parses,
 //! `evidence check` passes with `cleanup_status success`, and zero leaked
@@ -25,9 +25,10 @@
 //! `SALVAGE_FAULT_MATRIX_REPEATS=N` repeats each row (CI uses 2) because O4
 //! requires the matrix to pass *repeatedly* with deterministic verdicts.
 //!
-//! No external network: PG is Unix-socket-only, contracts are `sql`/`exec`
-//! only (no `http` contract, so no local server is needed), the digest pin is
-//! local, and `/dev/full` is a kernel-guaranteed `ENOSPC`-class writer.
+//! No external network: PG is Unix-socket-only, most contracts are
+//! `sql`/`exec` only (the oversized row spawns a loopback HTTP server, still
+//! no external traffic), the digest pin is local, and `/dev/full` is a
+//! kernel-guaranteed `ENOSPC`-class writer.
 //!
 //! Deliberately deferred to later O4 slices (see #45): missing extension
 //! at E2E (classifier unit-tested with real message shapes; a deterministic
@@ -306,6 +307,8 @@ fn assert_failed_run(
         Some(expected_classification),
         "wrong classification for {expected_code}"
     );
+    // Cleanup state comes from the bundle itself: `evidence check` reports
+    // the bundle (completeness + classification), never cleanup status.
     let check = Command::new(salvage_bin())
         .args([
             "evidence",
@@ -322,15 +325,27 @@ fn assert_failed_run(
         )),
         "check must report {expected_classification}: {check_stdout}"
     );
-    assert!(
-        check_stdout.contains(r#""cleanup_status":"success""#)
-            || String::from_utf8_lossy(&out.stderr).contains(r#""cleanup_status":"success""#),
-        "cleanup must succeed on every fault path: check={check_stdout} stderr={stderr}"
+    assert_eq!(
+        evidence["cleanup"]["status"].as_str(),
+        Some("success"),
+        "cleanup must succeed on every fault path"
     );
     assert_zero_leak(run_id, run_dir);
 }
+
+/// Parses the single-line run-result JSON the CLI prints on failure
+/// (`{"status":"error","code":...,"verdict":...,"stage":...}` on stderr),
+/// so rows can assert `code`/`verdict`/`stage` fields instead of substrings.
+fn run_result_json(out: &std::process::Output) -> serde_json::Value {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = stderr
+        .lines()
+        .find(|l| l.trim_start().starts_with('{'))
+        .expect("run result JSON on stderr");
+    serde_json::from_str(line).expect("run result JSON parses")
+}
 /// Waits for a `stage-started` journal event for `stage` (e.g.
-/// `"stage":"contracts", lowercase kebab-case as persisted) so signals land
+/// `"stage":"contracts"`, lowercase kebab-case as persisted) so signals land
 /// deterministically in that stage.
 fn wait_for_journal_stage(run_dir: &Path, stage: &str, timeout_secs: u64) {
     let journal = run_dir.join("journal.jsonl");
@@ -528,7 +543,9 @@ fn malformed_contract_argv_full_slice() {
         let tmp = unique_temp_dir("malformed-contract");
         // `rm` passes manifest shape validation (non-blank entries) but is
         // rejected by the exec allowlist at runtime *before* any spawn, so
-        // this row is safe by construction and asserts `pid` was never set.
+        // this row is safe by construction. Never-spawned is inferred from
+        // the allowlist rejection (`ContractEvidence` carries no pid; the
+        // pre-spawn check is at `run_exec`, allowlist branch).
         let contracts = serde_json::json!([
             {"name": "users-count", "kind": "sql",
              "spec": {"query": "SELECT count(*) FROM salvage_records"}, "timeout_ms": 10000},
@@ -584,9 +601,12 @@ fn oversized_contract_output_full_slice() {
     // instead. The HTTP backend drains the body concurrently, so the
     // default 64 KiB cap deterministically yields `contract/oversized`.
     // (Unit coverage of exec/sql oversized lives in `contracts.rs`.)
-    let big = "y".repeat(70_000);
-    let http_port = spawn_local_http_200(big);
+    // Spawned per iteration: the server's request/lifetime budget must not
+    // be shared across repeats, or a slow first iteration could starve the
+    // second into a `contract/crash` flake.
     for _ in 0..matrix_repeats() {
+        let big = "y".repeat(70_000);
+        let http_port = spawn_local_http_200(big);
         let tmp = unique_temp_dir("oversized-contract");
         let contracts = serde_json::json!([
             {"name": "big-body", "kind": "http",
@@ -706,21 +726,53 @@ fn sigterm_mid_contracts_cancels_full_slice() {
             .spawn()
             .expect("spawn salvage");
         // Land the signal deterministically inside the contracts stage: the
-        // journal records `StageStarted` per stage as the run progresses.
+        // journal records `stage-started` per stage as the run progresses.
         wait_for_journal_stage(&run_dir, "\"stage\":\"contracts\"", 240);
         unsafe {
             libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
         }
         let out = child.wait_with_output().expect("wait on child");
         let elapsed = start.elapsed().as_secs();
+        // Bound well under the `sleep 60` natural end: restore+boot take
+        // ~10-25 s, so elapsed < 60 proves the interrupt preempted the hung
+        // child instead of letting it run out (which would still cancel at
+        // the boundary, only much later).
         assert_failed_run(
             &out,
             elapsed,
             "cancelled",
             "cancelled",
-            300,
+            60,
             &run_id,
             &run_dir,
+        );
+        // And the cancellation must be recorded as such: a `stage-cancelled`
+        // contracts event, no `stage-completed` for contracts, and no
+        // completed contract evidence (the partial run is discarded, not
+        // reported as passed/failed).
+        let journal = fs::read_to_string(run_dir.join("journal.jsonl")).unwrap();
+        assert!(
+            journal
+                .lines()
+                .any(|l| l.contains("\"event\":\"stage-cancelled\"")
+                    && l.contains("\"stage\":\"contracts\"")),
+            "journal must record contracts cancellation: {}",
+            journal.lines().last().unwrap_or("")
+        );
+        assert!(
+            !journal
+                .lines()
+                .any(|l| l.contains("\"event\":\"stage-completed\"")
+                    && l.contains("\"stage\":\"contracts\"")),
+            "contracts stage must not complete on cancel"
+        );
+        let evidence = parse_evidence(&run_dir);
+        assert!(
+            evidence
+                .get("contracts")
+                .is_none_or(|c| c.is_null() || c.as_array().is_some_and(|a| a.is_empty())),
+            "cancelled run must not report completed contracts: {}",
+            evidence["contracts"]
         );
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -772,6 +824,14 @@ fn global_deadline_expires_full_slice() {
             &run_id,
             &run_dir,
         );
+        // Assert the structured fields, not just substrings: the CLI `code`
+        // is `timeout` (`timed-out` is the verdict), and the expiry must land
+        // in restore — a slow validation firing first would still print
+        // `timed-out` but for the wrong stage.
+        let result = run_result_json(&out);
+        assert_eq!(result["code"].as_str(), Some("timeout"));
+        assert_eq!(result["verdict"].as_str(), Some("timed-out"));
+        assert_eq!(result["stage"].as_str(), Some("restore"));
         let _ = fs::remove_dir_all(&tmp);
     }
 }
