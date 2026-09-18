@@ -1,5 +1,6 @@
 //! O4-1 fault matrix: full-slice faults with expected verdicts (parent #45).
 //! O4-3 adds resource-exhaustion and slow-child rows (parent #45, issue #49).
+//! O4-4 adds remaining isolation/cancellation rows (parent #45, issue #50).
 //!
 //! Opt-in Docker matrix (`SALVAGE_TEST_DOCKER=1`, `#[ignore]` by default so
 //! `cargo test` stays green for non-Docker devs). Precedent: `e2e_contracts.rs`.
@@ -20,8 +21,10 @@
 //! | evidence-write read-only | `evidence.destination` under `chmod 555` dir | `evidence/write-failed` | `verification-failed` |
 //! | evidence-write tmpfs ENOSPC | tiny `tmpfs` destination, pre-filled (Linux + mount priv, loud skip) | `evidence/write-failed` | `verification-failed` |
 //! | SIGTERM mid-contracts | `SIGTERM` while an `exec sleep` contract runs | `cancelled` | `cancelled` |
+//! | SIGINT mid-boot | `SIGINT` while boot readiness hangs (journal-synced to boot) | `cancelled` | `cancelled` |
 //! | global deadline expiry | `SALVAGE_TEST_GLOBAL_TIMEOUT_MS` + restore delay hook | `timeout` (code; verdict is `timed-out`) | `timed-out` |
 //! | restore stage-timeout hang | `restore_seconds` shorter than `SALVAGE_TEST_RESTORE_DELAY_MS` | `timeout` (code; verdict is `timed-out`) | `timed-out` |
+//! | verify stage-timeout hang | `verify_seconds` shorter than `SALVAGE_TEST_VERIFY_DELAY_MS` | `timeout` (code; verdict is `timed-out`) | `timed-out` |
 //!
 //! Every row additionally asserts: bounded wall-clock, evidence bundle parses,
 //! `evidence check` passes with `cleanup_status success`, and zero leaked
@@ -43,11 +46,19 @@
 //! otherwise, and the read-only row covers a second write-failure variant on
 //! the same path.
 //!
-//! Deliberately deferred to later O4 slices (see #45): missing extension
+//! Deliberately deferred beyond O4 (see #45): missing extension
 //! at E2E (classifier unit-tested with real message shapes; a deterministic
 //! fixture needs a multi-extension toolchain — the committed dumps carry no
-//! extension entries to diverge, see ADR 0008), and
-//! reachable-egress E2E (needs a responder outside the isolated net, see #50).
+//! extension entries to diverge, see ADR 0008).
+//!
+//! Reachable-egress stays unit-double-only by design (O4-4 closeout): the
+//! per-run `--internal` isolated network cannot route outside by
+//! construction, so a positive E2E would require breaking the very isolation
+//! under test. The blocked case is covered full-slice (O3 `e2e_contracts.rs`
+//! forbidden-egress row + every v3 fault row asserting `allowed:false`
+//! isolation evidence); the reachable shape (`isolation/egress-allowed`) is
+//! covered by `salvage-oci` unit tests with a fake `docker` double forcing
+//! `docker exec` exit 0, plus the `policy-failed` fail-closed doubles.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1077,6 +1088,186 @@ fn evidence_write_tmpfs_enospc_full_slice() {
             &run_dir,
         );
         let _ = Command::new("umount").arg(&mnt).output();
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}
+
+#[test]
+#[ignore]
+fn sigint_mid_boot_cancels_full_slice() {
+    if !require_docker() {
+        return;
+    }
+    // O4-4 signal pair with O4-1's SIGTERM-mid-contracts row: `SIGINT`
+    // journal-synced into the boot stage. Boot is stretched by pointing
+    // readiness at a closed port (tcp 9, valid but never open) with a long
+    // `boot_seconds` budget, so `wait_ready` loops on the stage deadline
+    // until the signal preempts it — the same determinism shape as the
+    // `sleep 60` contracts row, but in a different stage with the other
+    // signal.
+    let tag = "salvage-tiny-http:test";
+    let digest = ensure_image(&image_context("tiny-http"), tag).expect("build tiny-http");
+    for _ in 0..matrix_repeats() {
+        let tmp = unique_temp_dir("sigint-boot");
+        let manifest_path = write_v3_fault(
+            &digest,
+            None,
+            None,
+            Some(sql_exec_contracts()),
+            Some(120),
+            None,
+            &tmp,
+        );
+        // Stretch boot: readiness on a closed port never becomes ready.
+        let text = fs::read_to_string(&manifest_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["app"]["readiness"]["port"] = serde_json::Value::from(9);
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&value).unwrap(),
+        )
+        .unwrap();
+        let dump_dst = tmp.join("backup.dump");
+        fs::copy(fixture_path("valid-pg16-custom.dump"), &dump_dst).unwrap();
+        let run_dir = tmp.join("run");
+        let run_id = unique_run_id("sigint");
+
+        let start = Instant::now();
+        let child = Command::new(salvage_bin())
+            .args([
+                "run",
+                manifest_path.to_str().unwrap(),
+                "--backup",
+                dump_dst.to_str().unwrap(),
+                "--run-dir",
+                run_dir.to_str().unwrap(),
+                "--run-id",
+                &run_id,
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn salvage");
+        // Land the signal deterministically inside boot.
+        wait_for_journal_stage(&run_dir, "\"stage\":\"boot\"", 240);
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+        }
+        let out = child.wait_with_output().expect("wait on child");
+        let elapsed = start.elapsed().as_secs();
+        // Bound well under the 120 s boot budget: restore+boot take ~10-25 s,
+        // so elapsed proves the interrupt preempted the hung readiness probe
+        // instead of running out the stage deadline.
+        assert_failed_run(
+            &out,
+            elapsed,
+            "cancelled",
+            "cancelled",
+            120,
+            &run_id,
+            &run_dir,
+        );
+        let result = run_result_json(&out);
+        assert_eq!(result["code"].as_str(), Some("cancelled"));
+        assert_eq!(result["verdict"].as_str(), Some("cancelled"));
+        assert_eq!(result["stage"].as_str(), Some("boot"));
+        // Cancellation must be recorded as such: a `stage-cancelled` boot
+        // event carrying the SIGINT signal, no `stage-completed` for boot,
+        // and no completed contract evidence (contracts never ran).
+        let journal = fs::read_to_string(run_dir.join("journal.jsonl")).unwrap();
+        assert!(
+            journal
+                .lines()
+                .any(|l| l.contains("\"event\":\"stage-cancelled\"")
+                    && l.contains("\"stage\":\"boot\"")),
+            "journal must record boot cancellation"
+        );
+        assert!(
+            journal.contains("SIGINT"),
+            "journal must record the SIGINT signal: {}",
+            journal.lines().last().unwrap_or("")
+        );
+        assert!(
+            !journal
+                .lines()
+                .any(|l| l.contains("\"event\":\"stage-completed\"")
+                    && l.contains("\"stage\":\"boot\"")),
+            "boot stage must not complete on cancel"
+        );
+        let evidence = parse_evidence(&run_dir);
+        assert!(
+            evidence
+                .get("contracts")
+                .is_none_or(|c| c.is_null() || c.as_array().is_some_and(|a| a.is_empty())),
+            "cancelled-in-boot run must not report completed contracts: {}",
+            evidence["contracts"]
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}
+
+#[test]
+#[ignore]
+fn verify_stage_timeout_hang_full_slice() {
+    if !require_docker() {
+        return;
+    }
+    // O4-4 verify-deadline variant (complements O4-1's global-deadline and
+    // O4-3's restore stage-timeout variants): `verify_seconds` is shorter
+    // than the test-only verify delay hook, so the stage deadline fires
+    // deterministically inside verification. The delay loop polls
+    // `deadline.is_expired()` every 50 ms, so expiry preempts the hung
+    // verification instead of running out the delay. No manifest/flag
+    // change: hook mirrors the `SALVAGE_TEST_RESTORE_DELAY_MS` precedent.
+    for _ in 0..matrix_repeats() {
+        let tmp = unique_temp_dir("verify-stage-timeout");
+        let manifest_path = write_v3_fault(
+            "sha256:e22a313ea41b0ce4bc1919997a651a41fc0ae71eaf7d605bc2cbfd03e0a32cb8",
+            None,
+            None,
+            Some(sql_exec_contracts()),
+            None,
+            None,
+            &tmp,
+        );
+        // Shrink only `verify_seconds` to 2 s: validation comfortably fits,
+        // the 15 s verify delay cannot. Patched post-write so the shared
+        // `write_v3_fault` helper keeps its 7-arg shape (no flag change).
+        let text = fs::read_to_string(&manifest_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["deadlines"]["verify_seconds"] = serde_json::Value::from(2);
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&value).unwrap(),
+        )
+        .unwrap();
+        let dump_dst = tmp.join("backup.dump");
+        fs::copy(fixture_path("valid-pg16-custom.dump"), &dump_dst).unwrap();
+        let run_dir = tmp.join("run");
+        let run_id = unique_run_id("verifytimeout");
+
+        let start = Instant::now();
+        let out = run_salavage(
+            &manifest_path,
+            &dump_dst,
+            &run_dir,
+            &run_id,
+            &[("SALVAGE_TEST_VERIFY_DELAY_MS", "15000")],
+        );
+        let elapsed = start.elapsed().as_secs();
+        assert_failed_run(
+            &out,
+            elapsed,
+            "timed-out",
+            "timed-out",
+            120,
+            &run_id,
+            &run_dir,
+        );
+        let result = run_result_json(&out);
+        assert_eq!(result["code"].as_str(), Some("timeout"));
+        assert_eq!(result["verdict"].as_str(), Some("timed-out"));
+        assert_eq!(result["stage"].as_str(), Some("verification"));
         let _ = fs::remove_dir_all(&tmp);
     }
 }
