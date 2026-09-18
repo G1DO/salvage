@@ -178,6 +178,42 @@ impl StageExecutor for PostgresStageExecutor {
         Ok(())
     }
 
+    fn execute_verification(
+        &mut self,
+        ctx: &mut StageContext<'_>,
+    ) -> Result<(), StageExecutionError> {
+        // O4-4: test-only verify-stage delay hook. The production
+        // verification path is a fast structural check with no natural
+        // slow shape, so the fault matrix cannot otherwise stretch
+        // verification past `verify_seconds` deterministically. Mirrors the
+        // `SALVAGE_TEST_RESTORE_DELAY_MS` precedent: never set in
+        // production, only read here so the matrix can force a
+        // verify-stage `timed-out` without changing manifest schema or CLI
+        // flags. Polls cancellation/deadline every 50 ms so SIGINT/SIGTERM
+        // and stage expiry preempt the delay exactly like the restore hook.
+        if let Ok(delay_str) = std::env::var("SALVAGE_TEST_VERIFY_DELAY_MS")
+            && let Ok(delay_ms) = delay_str.parse::<u64>()
+            && delay_ms > 0
+        {
+            let chunk = Duration::from_millis(50);
+            let mut elapsed = Duration::ZERO;
+            while elapsed < Duration::from_millis(delay_ms) {
+                if ctx.cancellation_token.is_cancelled() {
+                    return Err(StageExecutionError::cancelled(
+                        ctx.cancellation_token.cancellation_signal(),
+                        "verification cancelled by user signal",
+                    ));
+                }
+                if ctx.deadline.is_expired() {
+                    return Err(StageExecutionError::TimedOut);
+                }
+                std::thread::sleep(chunk);
+                elapsed += chunk;
+            }
+        }
+        Ok(())
+    }
+
     fn telemetry(&self) -> Option<salvage_core::lifecycle::RunTelemetry> {
         Some(salvage_core::lifecycle::RunTelemetry {
             observed_server_version: self.telemetry.server_version.clone(),
