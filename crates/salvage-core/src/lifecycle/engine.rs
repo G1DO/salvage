@@ -544,11 +544,11 @@ impl RunEngine {
         let val_start = Instant::now();
         let validation_deadline = StageDeadline::new(Duration::from_secs(60), global_deadline);
 
-        journal.record_event(EventPayload::StageStarted {
-            stage: Stage::Validation,
-            deadline_seconds: 60,
-        })?;
-
+        // Cancellation is checked before `StageStarted` is journaled: the
+        // signal rows sync on the started record, so a signal landing in
+        // between previously produced `cancelled` with no `stage-cancelled`
+        // event (flaked under parallel load). A started stage now always
+        // reaches its executor, which reports the terminal event.
         if config.cancellation_token.is_cancelled() {
             let sig = config.cancellation_token.cancellation_signal();
             final_verdict = Some(Verdict::cancelled(
@@ -556,49 +556,56 @@ impl RunEngine {
                 sig,
                 "cancelled before validation",
             ));
-        } else if validation_deadline.is_expired() {
-            final_verdict = Some(Verdict::timed_out(Stage::Validation, 60));
         } else {
-            let mut ctx = StageContext {
-                run_id: &run_id,
-                manifest: &manifest,
-                manifest_hash: &hash,
-                resource_manager: &mut resource_manager,
-                deadline: &validation_deadline,
-                cancellation_token: &config.cancellation_token,
-                journal: &journal,
-                telemetry: &mut telemetry,
-            };
+            journal.record_event(EventPayload::StageStarted {
+                stage: Stage::Validation,
+                deadline_seconds: 60,
+            })?;
 
-            match executor.execute_validation(&mut ctx) {
-                Ok(()) => {
-                    journal.record_event(EventPayload::StageCompleted {
-                        stage: Stage::Validation,
-                        duration_ms: val_start.elapsed().as_millis() as u64,
-                    })?;
-                }
-                Err(StageExecutionError::Failed { code, message }) => {
-                    journal.record_event(EventPayload::StageFailed {
-                        stage: Stage::Validation,
-                        code: code.clone(),
-                        message: message.clone(),
-                    })?;
-                    final_verdict = Some(Verdict::failed(Stage::Validation, code, message));
-                }
-                Err(StageExecutionError::TimedOut) => {
-                    journal.record_event(EventPayload::StageTimedOut {
-                        stage: Stage::Validation,
-                        timeout_seconds: 60,
-                    })?;
-                    final_verdict = Some(Verdict::timed_out(Stage::Validation, 60));
-                }
-                Err(StageExecutionError::Cancelled { signal, reason }) => {
-                    journal.record_event(EventPayload::StageCancelled {
-                        stage: Stage::Validation,
-                        signal: signal.clone(),
-                        reason: reason.clone(),
-                    })?;
-                    final_verdict = Some(Verdict::cancelled(Stage::Validation, signal, reason));
+            if validation_deadline.is_expired() {
+                final_verdict = Some(Verdict::timed_out(Stage::Validation, 60));
+            } else {
+                let mut ctx = StageContext {
+                    run_id: &run_id,
+                    manifest: &manifest,
+                    manifest_hash: &hash,
+                    resource_manager: &mut resource_manager,
+                    deadline: &validation_deadline,
+                    cancellation_token: &config.cancellation_token,
+                    journal: &journal,
+                    telemetry: &mut telemetry,
+                };
+
+                match executor.execute_validation(&mut ctx) {
+                    Ok(()) => {
+                        journal.record_event(EventPayload::StageCompleted {
+                            stage: Stage::Validation,
+                            duration_ms: val_start.elapsed().as_millis() as u64,
+                        })?;
+                    }
+                    Err(StageExecutionError::Failed { code, message }) => {
+                        journal.record_event(EventPayload::StageFailed {
+                            stage: Stage::Validation,
+                            code: code.clone(),
+                            message: message.clone(),
+                        })?;
+                        final_verdict = Some(Verdict::failed(Stage::Validation, code, message));
+                    }
+                    Err(StageExecutionError::TimedOut) => {
+                        journal.record_event(EventPayload::StageTimedOut {
+                            stage: Stage::Validation,
+                            timeout_seconds: 60,
+                        })?;
+                        final_verdict = Some(Verdict::timed_out(Stage::Validation, 60));
+                    }
+                    Err(StageExecutionError::Cancelled { signal, reason }) => {
+                        journal.record_event(EventPayload::StageCancelled {
+                            stage: Stage::Validation,
+                            signal: signal.clone(),
+                            reason: reason.clone(),
+                        })?;
+                        final_verdict = Some(Verdict::cancelled(Stage::Validation, signal, reason));
+                    }
                 }
             }
         }
@@ -630,11 +637,8 @@ impl RunEngine {
                 global_deadline,
             );
 
-            journal.record_event(EventPayload::StageStarted {
-                stage: Stage::Restore,
-                deadline_seconds: restore_timeout_secs,
-            })?;
-
+            // Cancellation precedes `StageStarted` (see validation stage):
+            // a started stage always reaches its executor.
             if config.cancellation_token.is_cancelled() {
                 let sig = config.cancellation_token.cancellation_signal();
                 final_verdict = Some(Verdict::cancelled(
@@ -642,50 +646,58 @@ impl RunEngine {
                     sig,
                     "cancelled before restore",
                 ));
-            } else if restore_deadline.is_expired() {
-                final_verdict = Some(Verdict::timed_out(Stage::Restore, restore_timeout_secs));
             } else {
-                let mut ctx = StageContext {
-                    run_id: &run_id,
-                    manifest: &manifest,
-                    manifest_hash: &hash,
-                    resource_manager: &mut resource_manager,
-                    deadline: &restore_deadline,
-                    cancellation_token: &config.cancellation_token,
-                    journal: &journal,
-                    telemetry: &mut telemetry,
-                };
+                journal.record_event(EventPayload::StageStarted {
+                    stage: Stage::Restore,
+                    deadline_seconds: restore_timeout_secs,
+                })?;
 
-                match executor.execute_restore(&mut ctx) {
-                    Ok(()) => {
-                        journal.record_event(EventPayload::StageCompleted {
-                            stage: Stage::Restore,
-                            duration_ms: restore_start.elapsed().as_millis() as u64,
-                        })?;
-                    }
-                    Err(StageExecutionError::Failed { code, message }) => {
-                        journal.record_event(EventPayload::StageFailed {
-                            stage: Stage::Restore,
-                            code: code.clone(),
-                            message: message.clone(),
-                        })?;
-                        final_verdict = Some(Verdict::failed(Stage::Restore, code, message));
-                    }
-                    Err(StageExecutionError::TimedOut) => {
-                        journal.record_event(EventPayload::StageTimedOut {
-                            stage: Stage::Restore,
-                            timeout_seconds: restore_timeout_secs,
-                        })?;
-                        final_verdict =
-                            Some(Verdict::timed_out(Stage::Restore, restore_timeout_secs));
-                    }
-                    Err(StageExecutionError::Cancelled { signal, reason }) => {
-                        journal.record_event(EventPayload::StageCancelled {
-                            stage: Stage::Restore,
-                            signal: signal.clone(),
-                            reason: reason.clone(),
-                        })?;
-                        final_verdict = Some(Verdict::cancelled(Stage::Restore, signal, reason));
+                if restore_deadline.is_expired() {
+                    final_verdict = Some(Verdict::timed_out(Stage::Restore, restore_timeout_secs));
+                } else {
+                    let mut ctx = StageContext {
+                        run_id: &run_id,
+                        manifest: &manifest,
+                        manifest_hash: &hash,
+                        resource_manager: &mut resource_manager,
+                        deadline: &restore_deadline,
+                        cancellation_token: &config.cancellation_token,
+                        journal: &journal,
+                        telemetry: &mut telemetry,
+                    };
+
+                    match executor.execute_restore(&mut ctx) {
+                        Ok(()) => {
+                            journal.record_event(EventPayload::StageCompleted {
+                                stage: Stage::Restore,
+                                duration_ms: restore_start.elapsed().as_millis() as u64,
+                            })?;
+                        }
+                        Err(StageExecutionError::Failed { code, message }) => {
+                            journal.record_event(EventPayload::StageFailed {
+                                stage: Stage::Restore,
+                                code: code.clone(),
+                                message: message.clone(),
+                            })?;
+                            final_verdict = Some(Verdict::failed(Stage::Restore, code, message));
+                        }
+                        Err(StageExecutionError::TimedOut) => {
+                            journal.record_event(EventPayload::StageTimedOut {
+                                stage: Stage::Restore,
+                                timeout_seconds: restore_timeout_secs,
+                            })?;
+                            final_verdict =
+                                Some(Verdict::timed_out(Stage::Restore, restore_timeout_secs));
+                        }
+                        Err(StageExecutionError::Cancelled { signal, reason }) => {
+                            journal.record_event(EventPayload::StageCancelled {
+                                stage: Stage::Restore,
+                                signal: signal.clone(),
+                                reason: reason.clone(),
+                            })?;
+                            final_verdict =
+                                Some(Verdict::cancelled(Stage::Restore, signal, reason));
+                        }
                     }
                 }
             }
@@ -718,11 +730,8 @@ impl RunEngine {
                 global_deadline,
             );
 
-            journal.record_event(EventPayload::StageStarted {
-                stage: Stage::Verification,
-                deadline_seconds: verify_timeout_secs,
-            })?;
-
+            // Cancellation precedes `StageStarted` (see validation stage):
+            // a started stage always reaches its executor.
             if config.cancellation_token.is_cancelled() {
                 let sig = config.cancellation_token.cancellation_signal();
                 final_verdict = Some(Verdict::cancelled(
@@ -730,52 +739,61 @@ impl RunEngine {
                     sig,
                     "cancelled before verification",
                 ));
-            } else if verify_deadline.is_expired() {
-                final_verdict = Some(Verdict::timed_out(Stage::Verification, verify_timeout_secs));
             } else {
-                let mut ctx = StageContext {
-                    run_id: &run_id,
-                    manifest: &manifest,
-                    manifest_hash: &hash,
-                    resource_manager: &mut resource_manager,
-                    deadline: &verify_deadline,
-                    cancellation_token: &config.cancellation_token,
-                    journal: &journal,
-                    telemetry: &mut telemetry,
-                };
+                journal.record_event(EventPayload::StageStarted {
+                    stage: Stage::Verification,
+                    deadline_seconds: verify_timeout_secs,
+                })?;
 
-                match executor.execute_verification(&mut ctx) {
-                    Ok(()) => {
-                        journal.record_event(EventPayload::StageCompleted {
-                            stage: Stage::Verification,
-                            duration_ms: verify_start.elapsed().as_millis() as u64,
-                        })?;
-                        final_verdict = Some(Verdict::Passed);
-                    }
-                    Err(StageExecutionError::Failed { code, message }) => {
-                        journal.record_event(EventPayload::StageFailed {
-                            stage: Stage::Verification,
-                            code: code.clone(),
-                            message: message.clone(),
-                        })?;
-                        final_verdict = Some(Verdict::failed(Stage::Verification, code, message));
-                    }
-                    Err(StageExecutionError::TimedOut) => {
-                        journal.record_event(EventPayload::StageTimedOut {
-                            stage: Stage::Verification,
-                            timeout_seconds: verify_timeout_secs,
-                        })?;
-                        final_verdict =
-                            Some(Verdict::timed_out(Stage::Verification, verify_timeout_secs));
-                    }
-                    Err(StageExecutionError::Cancelled { signal, reason }) => {
-                        journal.record_event(EventPayload::StageCancelled {
-                            stage: Stage::Verification,
-                            signal: signal.clone(),
-                            reason: reason.clone(),
-                        })?;
-                        final_verdict =
-                            Some(Verdict::cancelled(Stage::Verification, signal, reason));
+                if verify_deadline.is_expired() {
+                    final_verdict =
+                        Some(Verdict::timed_out(Stage::Verification, verify_timeout_secs));
+                } else {
+                    let mut ctx = StageContext {
+                        run_id: &run_id,
+                        manifest: &manifest,
+                        manifest_hash: &hash,
+                        resource_manager: &mut resource_manager,
+                        deadline: &verify_deadline,
+                        cancellation_token: &config.cancellation_token,
+                        journal: &journal,
+                        telemetry: &mut telemetry,
+                    };
+
+                    match executor.execute_verification(&mut ctx) {
+                        Ok(()) => {
+                            journal.record_event(EventPayload::StageCompleted {
+                                stage: Stage::Verification,
+                                duration_ms: verify_start.elapsed().as_millis() as u64,
+                            })?;
+                            final_verdict = Some(Verdict::Passed);
+                        }
+                        Err(StageExecutionError::Failed { code, message }) => {
+                            journal.record_event(EventPayload::StageFailed {
+                                stage: Stage::Verification,
+                                code: code.clone(),
+                                message: message.clone(),
+                            })?;
+                            final_verdict =
+                                Some(Verdict::failed(Stage::Verification, code, message));
+                        }
+                        Err(StageExecutionError::TimedOut) => {
+                            journal.record_event(EventPayload::StageTimedOut {
+                                stage: Stage::Verification,
+                                timeout_seconds: verify_timeout_secs,
+                            })?;
+                            final_verdict =
+                                Some(Verdict::timed_out(Stage::Verification, verify_timeout_secs));
+                        }
+                        Err(StageExecutionError::Cancelled { signal, reason }) => {
+                            journal.record_event(EventPayload::StageCancelled {
+                                stage: Stage::Verification,
+                                signal: signal.clone(),
+                                reason: reason.clone(),
+                            })?;
+                            final_verdict =
+                                Some(Verdict::cancelled(Stage::Verification, signal, reason));
+                        }
                     }
                 }
             }
@@ -812,11 +830,8 @@ impl RunEngine {
                 global_deadline,
             );
 
-            journal.record_event(EventPayload::StageStarted {
-                stage: Stage::Boot,
-                deadline_seconds: boot_timeout_secs,
-            })?;
-
+            // Cancellation precedes `StageStarted` (see validation stage):
+            // a started stage always reaches its executor.
             if config.cancellation_token.is_cancelled() {
                 let sig = config.cancellation_token.cancellation_signal();
                 final_verdict = Some(Verdict::cancelled(
@@ -824,49 +839,57 @@ impl RunEngine {
                     sig,
                     "cancelled before boot",
                 ));
-            } else if boot_deadline.is_expired() {
-                final_verdict = Some(Verdict::timed_out(Stage::Boot, boot_timeout_secs));
             } else {
-                let mut ctx = StageContext {
-                    run_id: &run_id,
-                    manifest: &manifest,
-                    manifest_hash: &hash,
-                    resource_manager: &mut resource_manager,
-                    deadline: &boot_deadline,
-                    cancellation_token: &config.cancellation_token,
-                    journal: &journal,
-                    telemetry: &mut telemetry,
-                };
+                journal.record_event(EventPayload::StageStarted {
+                    stage: Stage::Boot,
+                    deadline_seconds: boot_timeout_secs,
+                })?;
 
-                match executor.execute_boot(&mut ctx) {
-                    Ok(()) => {
-                        journal.record_event(EventPayload::StageCompleted {
-                            stage: Stage::Boot,
-                            duration_ms: boot_start.elapsed().as_millis() as u64,
-                        })?;
-                    }
-                    Err(StageExecutionError::Failed { code, message }) => {
-                        journal.record_event(EventPayload::StageFailed {
-                            stage: Stage::Boot,
-                            code: code.clone(),
-                            message: message.clone(),
-                        })?;
-                        final_verdict = Some(Verdict::failed(Stage::Boot, code, message));
-                    }
-                    Err(StageExecutionError::TimedOut) => {
-                        journal.record_event(EventPayload::StageTimedOut {
-                            stage: Stage::Boot,
-                            timeout_seconds: boot_timeout_secs,
-                        })?;
-                        final_verdict = Some(Verdict::timed_out(Stage::Boot, boot_timeout_secs));
-                    }
-                    Err(StageExecutionError::Cancelled { signal, reason }) => {
-                        journal.record_event(EventPayload::StageCancelled {
-                            stage: Stage::Boot,
-                            signal: signal.clone(),
-                            reason: reason.clone(),
-                        })?;
-                        final_verdict = Some(Verdict::cancelled(Stage::Boot, signal, reason));
+                if boot_deadline.is_expired() {
+                    final_verdict = Some(Verdict::timed_out(Stage::Boot, boot_timeout_secs));
+                } else {
+                    let mut ctx = StageContext {
+                        run_id: &run_id,
+                        manifest: &manifest,
+                        manifest_hash: &hash,
+                        resource_manager: &mut resource_manager,
+                        deadline: &boot_deadline,
+                        cancellation_token: &config.cancellation_token,
+                        journal: &journal,
+                        telemetry: &mut telemetry,
+                    };
+
+                    match executor.execute_boot(&mut ctx) {
+                        Ok(()) => {
+                            journal.record_event(EventPayload::StageCompleted {
+                                stage: Stage::Boot,
+                                duration_ms: boot_start.elapsed().as_millis() as u64,
+                            })?;
+                        }
+                        Err(StageExecutionError::Failed { code, message }) => {
+                            journal.record_event(EventPayload::StageFailed {
+                                stage: Stage::Boot,
+                                code: code.clone(),
+                                message: message.clone(),
+                            })?;
+                            final_verdict = Some(Verdict::failed(Stage::Boot, code, message));
+                        }
+                        Err(StageExecutionError::TimedOut) => {
+                            journal.record_event(EventPayload::StageTimedOut {
+                                stage: Stage::Boot,
+                                timeout_seconds: boot_timeout_secs,
+                            })?;
+                            final_verdict =
+                                Some(Verdict::timed_out(Stage::Boot, boot_timeout_secs));
+                        }
+                        Err(StageExecutionError::Cancelled { signal, reason }) => {
+                            journal.record_event(EventPayload::StageCancelled {
+                                stage: Stage::Boot,
+                                signal: signal.clone(),
+                                reason: reason.clone(),
+                            })?;
+                            final_verdict = Some(Verdict::cancelled(Stage::Boot, signal, reason));
+                        }
                     }
                 }
             }
@@ -906,10 +929,8 @@ impl RunEngine {
             }
             if final_verdict.as_ref().is_some_and(Verdict::is_passed) {
                 let contracts_start = Instant::now();
-                journal.record_event(EventPayload::StageStarted {
-                    stage: Stage::Contracts,
-                    deadline_seconds: 0,
-                })?;
+                // Cancellation precedes `StageStarted` (see validation stage):
+                // a started stage always reaches its executor.
                 if config.cancellation_token.is_cancelled() {
                     let sig = config.cancellation_token.cancellation_signal();
                     final_verdict = Some(Verdict::cancelled(
@@ -918,6 +939,11 @@ impl RunEngine {
                         "cancelled before contracts",
                     ));
                 } else {
+                    journal.record_event(EventPayload::StageStarted {
+                        stage: Stage::Contracts,
+                        deadline_seconds: 0,
+                    })?;
+
                     // Generous outer deadline: sum of per-contract budgets is
                     // enforced inside `execute_contracts`; here we only guard
                     // cancellation. Use a dummy far-future deadline.
