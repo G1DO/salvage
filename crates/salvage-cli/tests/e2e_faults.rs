@@ -847,3 +847,67 @@ fn global_deadline_expires_full_slice() {
         let _ = fs::remove_dir_all(&tmp);
     }
 }
+#[test]
+#[ignore]
+fn restore_stage_timeout_hang_full_slice() {
+    if !require_docker() {
+        return;
+    }
+    // O4-3 stage-timeout variant (complements O4-1's global-deadline
+    // variant): `restore_seconds` is shorter than the test-only restore
+    // delay hook, so the stage deadline fires deterministically inside
+    // restore. The delay loop polls `deadline.is_expired()` every 50 ms,
+    // so expiry preempts the hung child instead of running out the delay.
+    for _ in 0..matrix_repeats() {
+        let tmp = unique_temp_dir("restore-stage-timeout");
+        let manifest_path = write_v3_fault(
+            "sha256:e22a313ea41b0ce4bc1919997a651a41fc0ae71eaf7d605bc2cbfd03e0a32cb8",
+            None,
+            None,
+            Some(sql_exec_contracts()),
+            None,
+            None,
+            &tmp,
+        );
+        // Shrink only `restore_seconds` to 2 s: validation comfortably fits,
+        // the 15 s restore delay cannot. Patched post-write so the shared
+        // `write_v3_fault` helper keeps its 7-arg shape (no flag change).
+        let text = fs::read_to_string(&manifest_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["deadlines"]["restore_seconds"] = serde_json::Value::from(2);
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&value).unwrap(),
+        )
+        .unwrap();
+        let dump_dst = tmp.join("backup.dump");
+        fs::copy(fixture_path("valid-pg16-custom.dump"), &dump_dst).unwrap();
+        let run_dir = tmp.join("run");
+        let run_id = unique_run_id("restimeout");
+
+        let start = Instant::now();
+        let out = run_salavage(
+            &manifest_path,
+            &dump_dst,
+            &run_dir,
+            &run_id,
+            &[("SALVAGE_TEST_RESTORE_DELAY_MS", "15000")],
+        );
+        let elapsed = start.elapsed().as_secs();
+        assert_failed_run(
+            &out,
+            elapsed,
+            "timed-out",
+            "timed-out",
+            120,
+            &run_id,
+            &run_dir,
+        );
+        let result = run_result_json(&out);
+        assert_eq!(result["code"].as_str(), Some("timeout"));
+        assert_eq!(result["verdict"].as_str(), Some("timed-out"));
+        assert_eq!(result["stage"].as_str(), Some("restore"));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}
+
