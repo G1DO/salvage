@@ -1,4 +1,5 @@
 //! O4-1 fault matrix: full-slice faults with expected verdicts (parent #45).
+//! O4-3 adds resource-exhaustion and slow-child rows (parent #45, issue #49).
 //!
 //! Opt-in Docker matrix (`SALVAGE_TEST_DOCKER=1`, `#[ignore]` by default so
 //! `cargo test` stays green for non-Docker devs). Precedent: `e2e_contracts.rs`.
@@ -16,8 +17,11 @@
 //! | malformed contract | disallowed `argv[0]` (`rm`, never spawned) | `contract/malformed` | `verification-failed` |
 //! | oversized contract | 70 KiB HTTP body vs 64 KiB cap | `contract/oversized` | `verification-failed` |
 //! | evidence-write failure | `evidence.destination = file:///dev/full` (Linux) | `evidence/write-failed` | `verification-failed` |
+//! | evidence-write read-only | `evidence.destination` under `chmod 555` dir | `evidence/write-failed` | `verification-failed` |
+//! | evidence-write tmpfs ENOSPC | tiny `tmpfs` destination, pre-filled (Linux + mount priv, loud skip) | `evidence/write-failed` | `verification-failed` |
 //! | SIGTERM mid-contracts | `SIGTERM` while an `exec sleep` contract runs | `cancelled` | `cancelled` |
 //! | global deadline expiry | `SALVAGE_TEST_GLOBAL_TIMEOUT_MS` + restore delay hook | `timeout` (code; verdict is `timed-out`) | `timed-out` |
+//! | restore stage-timeout hang | `restore_seconds` shorter than `SALVAGE_TEST_RESTORE_DELAY_MS` | `timeout` (code; verdict is `timed-out`) | `timed-out` |
 //!
 //! Every row additionally asserts: bounded wall-clock, evidence bundle parses,
 //! `evidence check` passes with `cleanup_status success`, and zero leaked
@@ -27,15 +31,23 @@
 //!
 //! No external network: PG is Unix-socket-only, most contracts are
 //! `sql`/`exec` only (the oversized row spawns a loopback HTTP server, still
-//! no external traffic), the digest pin is local, and `/dev/full` is a
-//! kernel-guaranteed `ENOSPC`-class writer.
+//! no external traffic), the digest pin is local, `/dev/full` is a
+//! kernel-guaranteed `ENOSPC`-class writer, and the read-only row uses a local
+//! `chmod 555` directory (same `persist`-error path, no extra deps).
+//!
+//! O4-3 true-filesystem-`ENOSPC` note: the taxonomy intentionally does not
+//! distinguish errno — every `persist` I/O error maps to
+//! `evidence/write-failed`. `/dev/full` is therefore the deterministic
+//! `ENOSPC`-class representative (always available on Linux CI); the tiny-
+//! `tmpfs` row is attempted first when mount privileges exist and loud-skips
+//! otherwise, and the read-only row covers a second write-failure variant on
+//! the same path.
 //!
 //! Deliberately deferred to later O4 slices (see #45): missing extension
 //! at E2E (classifier unit-tested with real message shapes; a deterministic
 //! fixture needs a multi-extension toolchain — the committed dumps carry no
-//! extension entries to diverge, see ADR 0008), true filesystem-`ENOSPC`
-//! (shares the `evidence/write-failed` path covered here), and
-//! reachable-egress E2E (needs a responder outside the isolated net).
+//! extension entries to diverge, see ADR 0008), and
+//! reachable-egress E2E (needs a responder outside the isolated net, see #50).
 
 use std::fs;
 use std::path::{Path, PathBuf};
