@@ -59,7 +59,7 @@ ls -la target/recovery-evidence-v3/
 salvage evidence check target/recovery-evidence-v3/evidence.json
 ```
 
-## O4 fault matrix (O4-1)
+## O4 fault matrix (O4-1 + O4-2 + O4-3)
 
 ```sh
 # Full-slice faults with expected verdicts (opt-in Docker, ignored by default):
@@ -69,7 +69,10 @@ SALVAGE_TEST_DOCKER=1 cargo test --test e2e_faults --locked -- --ignored
 # missing extension => restore/missing-extension (classifier units only; no E2E row yet, see #53)
 # wrong app digest => app/digest-mismatch + boot-failed
 # disallowed argv0 => contract/malformed; 70 KiB HTTP body => contract/oversized
-# destination file:///dev/full => evidence/write-failed (Linux)
+# destination file:///dev/full => evidence/write-failed (Linux, ENOSPC-class rep)
+# destination under chmod 555 dir => evidence/write-failed (EACCES variant, same path)
+# tiny tmpfs pre-filled => evidence/write-failed (true ENOSPC attempt; loud skip without mount priv, see #49)
+# restore_seconds < SALVAGE_TEST_RESTORE_DELAY_MS => timeout in restore (stage-timeout variant)
 # SIGTERM mid-contracts => cancelled (code; verdict cancelled); global deadline => timeout (code; verdict timed-out)
 # every row: bounded wall-clock, evidence check green, cleanup success, zero leak
 # repeat determinism: SALVAGE_FAULT_MATRIX_REPEATS=2 (CI uses 2)

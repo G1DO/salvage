@@ -1,4 +1,5 @@
 //! O4-1 fault matrix: full-slice faults with expected verdicts (parent #45).
+//! O4-3 adds resource-exhaustion and slow-child rows (parent #45, issue #49).
 //!
 //! Opt-in Docker matrix (`SALVAGE_TEST_DOCKER=1`, `#[ignore]` by default so
 //! `cargo test` stays green for non-Docker devs). Precedent: `e2e_contracts.rs`.
@@ -16,8 +17,11 @@
 //! | malformed contract | disallowed `argv[0]` (`rm`, never spawned) | `contract/malformed` | `verification-failed` |
 //! | oversized contract | 70 KiB HTTP body vs 64 KiB cap | `contract/oversized` | `verification-failed` |
 //! | evidence-write failure | `evidence.destination = file:///dev/full` (Linux) | `evidence/write-failed` | `verification-failed` |
+//! | evidence-write read-only | `evidence.destination` under `chmod 555` dir | `evidence/write-failed` | `verification-failed` |
+//! | evidence-write tmpfs ENOSPC | tiny `tmpfs` destination, pre-filled (Linux + mount priv, loud skip) | `evidence/write-failed` | `verification-failed` |
 //! | SIGTERM mid-contracts | `SIGTERM` while an `exec sleep` contract runs | `cancelled` | `cancelled` |
 //! | global deadline expiry | `SALVAGE_TEST_GLOBAL_TIMEOUT_MS` + restore delay hook | `timeout` (code; verdict is `timed-out`) | `timed-out` |
+//! | restore stage-timeout hang | `restore_seconds` shorter than `SALVAGE_TEST_RESTORE_DELAY_MS` | `timeout` (code; verdict is `timed-out`) | `timed-out` |
 //!
 //! Every row additionally asserts: bounded wall-clock, evidence bundle parses,
 //! `evidence check` passes with `cleanup_status success`, and zero leaked
@@ -27,15 +31,23 @@
 //!
 //! No external network: PG is Unix-socket-only, most contracts are
 //! `sql`/`exec` only (the oversized row spawns a loopback HTTP server, still
-//! no external traffic), the digest pin is local, and `/dev/full` is a
-//! kernel-guaranteed `ENOSPC`-class writer.
+//! no external traffic), the digest pin is local, `/dev/full` is a
+//! kernel-guaranteed `ENOSPC`-class writer, and the read-only row uses a local
+//! `chmod 555` directory (same `persist`-error path, no extra deps).
+//!
+//! O4-3 true-filesystem-`ENOSPC` note: the taxonomy intentionally does not
+//! distinguish errno — every `persist` I/O error maps to
+//! `evidence/write-failed`. `/dev/full` is therefore the deterministic
+//! `ENOSPC`-class representative (always available on Linux CI); the tiny-
+//! `tmpfs` row is attempted first when mount privileges exist and loud-skips
+//! otherwise, and the read-only row covers a second write-failure variant on
+//! the same path.
 //!
 //! Deliberately deferred to later O4 slices (see #45): missing extension
 //! at E2E (classifier unit-tested with real message shapes; a deterministic
 //! fixture needs a multi-extension toolchain — the committed dumps carry no
-//! extension entries to diverge, see ADR 0008), true filesystem-`ENOSPC`
-//! (shares the `evidence/write-failed` path covered here), and
-//! reachable-egress E2E (needs a responder outside the isolated net).
+//! extension entries to diverge, see ADR 0008), and
+//! reachable-egress E2E (needs a responder outside the isolated net, see #50).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -832,6 +844,239 @@ fn global_deadline_expires_full_slice() {
         assert_eq!(result["code"].as_str(), Some("timeout"));
         assert_eq!(result["verdict"].as_str(), Some("timed-out"));
         assert_eq!(result["stage"].as_str(), Some("restore"));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}
+#[test]
+#[ignore]
+fn restore_stage_timeout_hang_full_slice() {
+    if !require_docker() {
+        return;
+    }
+    // O4-3 stage-timeout variant (complements O4-1's global-deadline
+    // variant): `restore_seconds` is shorter than the test-only restore
+    // delay hook, so the stage deadline fires deterministically inside
+    // restore. The delay loop polls `deadline.is_expired()` every 50 ms,
+    // so expiry preempts the hung child instead of running out the delay.
+    for _ in 0..matrix_repeats() {
+        let tmp = unique_temp_dir("restore-stage-timeout");
+        let manifest_path = write_v3_fault(
+            "sha256:e22a313ea41b0ce4bc1919997a651a41fc0ae71eaf7d605bc2cbfd03e0a32cb8",
+            None,
+            None,
+            Some(sql_exec_contracts()),
+            None,
+            None,
+            &tmp,
+        );
+        // Shrink only `restore_seconds` to 2 s: validation comfortably fits,
+        // the 15 s restore delay cannot. Patched post-write so the shared
+        // `write_v3_fault` helper keeps its 7-arg shape (no flag change).
+        let text = fs::read_to_string(&manifest_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["deadlines"]["restore_seconds"] = serde_json::Value::from(2);
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&value).unwrap(),
+        )
+        .unwrap();
+        let dump_dst = tmp.join("backup.dump");
+        fs::copy(fixture_path("valid-pg16-custom.dump"), &dump_dst).unwrap();
+        let run_dir = tmp.join("run");
+        let run_id = unique_run_id("restimeout");
+
+        let start = Instant::now();
+        let out = run_salavage(
+            &manifest_path,
+            &dump_dst,
+            &run_dir,
+            &run_id,
+            &[("SALVAGE_TEST_RESTORE_DELAY_MS", "15000")],
+        );
+        let elapsed = start.elapsed().as_secs();
+        assert_failed_run(
+            &out,
+            elapsed,
+            "timed-out",
+            "timed-out",
+            120,
+            &run_id,
+            &run_dir,
+        );
+        let result = run_result_json(&out);
+        assert_eq!(result["code"].as_str(), Some("timeout"));
+        assert_eq!(result["verdict"].as_str(), Some("timed-out"));
+        assert_eq!(result["stage"].as_str(), Some("restore"));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}
+
+#[test]
+#[ignore]
+fn evidence_write_readonly_dest_full_slice() {
+    if !require_docker() {
+        return;
+    }
+    // O4-3 second write-failure variant on the same `persist`-error path as
+    // `/dev/full`: destination under a `chmod 555` directory fails with
+    // `EACCES`-class, which the taxonomy intentionally maps to the same
+    // `evidence/write-failed` (no errno distinction).
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipping read-only evidence-write row off Linux");
+        return;
+    }
+    // Root bypasses permission bits, so the fault would not fire.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if libc::geteuid() == 0 {
+            eprintln!("skipping read-only evidence-write row as root (chmod 555 is bypassed)");
+            return;
+        }
+    }
+    let tag = "salvage-tiny-http:test";
+    let digest = ensure_image(&image_context("tiny-http"), tag).expect("build tiny-http");
+    for _ in 0..matrix_repeats() {
+        let tmp = unique_temp_dir("evidence-readonly");
+        let readonly_dir = tmp.join("readonly");
+        fs::create_dir_all(&readonly_dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&readonly_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let dest = format!("file://{}/evidence", readonly_dir.display());
+        let manifest_path = write_v3_fault(
+            &digest,
+            None,
+            None,
+            Some(sql_exec_contracts()),
+            None,
+            Some(&dest),
+            &tmp,
+        );
+        let dump_dst = tmp.join("backup.dump");
+        fs::copy(fixture_path("valid-pg16-custom.dump"), &dump_dst).unwrap();
+        let run_dir = tmp.join("run");
+        let run_id = unique_run_id("evreadonly");
+
+        let start = Instant::now();
+        let out = run_salavage(&manifest_path, &dump_dst, &run_dir, &run_id, &[]);
+        let elapsed = start.elapsed().as_secs();
+        assert_failed_run(
+            &out,
+            elapsed,
+            "evidence/write-failed",
+            "verification-failed",
+            300,
+            &run_id,
+            &run_dir,
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&readonly_dir, fs::Permissions::from_mode(0o755));
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}
+
+#[test]
+#[ignore]
+fn evidence_write_tmpfs_enospc_full_slice() {
+    if !require_docker() {
+        return;
+    }
+    // O4-3 true-filesystem-`ENOSPC` attempt first: tiny `tmpfs` destination,
+    // pre-filled so the evidence write fails with real `ENOSPC`. Requires
+    // Linux + mount privileges; loud-skips otherwise and `/dev/full` stays
+    // the deterministic `ENOSPC`-class representative (same `persist` path).
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipping tmpfs ENOSPC row off Linux");
+        return;
+    }
+    let _ = fs::create_dir_all("/tmp/salvage-tmpfs-probe");
+    let mount_probe = Command::new("mount")
+        .args([
+            "-t",
+            "tmpfs",
+            "-o",
+            "size=64k",
+            "tmpfs",
+            "/tmp/salvage-tmpfs-probe",
+        ])
+        .output();
+    let can_mount = match mount_probe {
+        Ok(out) if out.status.success() => {
+            let _ = Command::new("umount")
+                .arg("/tmp/salvage-tmpfs-probe")
+                .output();
+            let _ = fs::remove_dir_all("/tmp/salvage-tmpfs-probe");
+            true
+        }
+        _ => false,
+    };
+    if !can_mount {
+        eprintln!(
+            "skipping tmpfs ENOSPC row: cannot mount tmpfs (needs priv); \
+             /dev/full remains the ENOSPC-class representative, see O4-3 #49"
+        );
+        return;
+    }
+    let tag = "salvage-tiny-http:test";
+    let digest = ensure_image(&image_context("tiny-http"), tag).expect("build tiny-http");
+    for _ in 0..matrix_repeats() {
+        let tmp = unique_temp_dir("evidence-tmpfs");
+        let mnt = tmp.join("mnt");
+        fs::create_dir_all(&mnt).unwrap();
+        let mount_out = Command::new("mount")
+            .args([
+                "-t",
+                "tmpfs",
+                "-o",
+                "size=64k",
+                "tmpfs",
+                mnt.to_str().unwrap(),
+            ])
+            .output()
+            .expect("mount tmpfs");
+        if !mount_out.status.success() {
+            eprintln!("skipping tmpfs ENOSPC iteration: mount failed, cleaning up");
+            let _ = fs::remove_dir_all(&tmp);
+            continue;
+        }
+        // Pre-fill the 64 KiB tmpfs so the evidence write deterministically
+        // hits real `ENOSPC` (evidence.json alone exceeds it).
+        let filler = mnt.join("filler");
+        let fill = vec![0u8; 128 * 1024];
+        let _ = fs::write(&filler, &fill);
+        let dest = format!("file://{}/evidence", mnt.display());
+        let manifest_path = write_v3_fault(
+            &digest,
+            None,
+            None,
+            Some(sql_exec_contracts()),
+            None,
+            Some(&dest),
+            &tmp,
+        );
+        let dump_dst = tmp.join("backup.dump");
+        fs::copy(fixture_path("valid-pg16-custom.dump"), &dump_dst).unwrap();
+        let run_dir = tmp.join("run");
+        let run_id = unique_run_id("evtmpfs");
+
+        let start = Instant::now();
+        let out = run_salavage(&manifest_path, &dump_dst, &run_dir, &run_id, &[]);
+        let elapsed = start.elapsed().as_secs();
+        assert_failed_run(
+            &out,
+            elapsed,
+            "evidence/write-failed",
+            "verification-failed",
+            300,
+            &run_id,
+            &run_dir,
+        );
+        let _ = Command::new("umount").arg(&mnt).output();
         let _ = fs::remove_dir_all(&tmp);
     }
 }
