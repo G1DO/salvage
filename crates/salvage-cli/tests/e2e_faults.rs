@@ -911,3 +911,172 @@ fn restore_stage_timeout_hang_full_slice() {
     }
 }
 
+#[test]
+#[ignore]
+fn evidence_write_readonly_dest_full_slice() {
+    if !require_docker() {
+        return;
+    }
+    // O4-3 second write-failure variant on the same `persist`-error path as
+    // `/dev/full`: destination under a `chmod 555` directory fails with
+    // `EACCES`-class, which the taxonomy intentionally maps to the same
+    // `evidence/write-failed` (no errno distinction).
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipping read-only evidence-write row off Linux");
+        return;
+    }
+    // Root bypasses permission bits, so the fault would not fire.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if libc::geteuid() == 0 {
+            eprintln!("skipping read-only evidence-write row as root (chmod 555 is bypassed)");
+            return;
+        }
+    }
+    let tag = "salvage-tiny-http:test";
+    let digest = ensure_image(&image_context("tiny-http"), tag).expect("build tiny-http");
+    for _ in 0..matrix_repeats() {
+        let tmp = unique_temp_dir("evidence-readonly");
+        let readonly_dir = tmp.join("readonly");
+        fs::create_dir_all(&readonly_dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&readonly_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let dest = format!("file://{}/evidence", readonly_dir.display());
+        let manifest_path = write_v3_fault(
+            &digest,
+            None,
+            None,
+            Some(sql_exec_contracts()),
+            None,
+            Some(&dest),
+            &tmp,
+        );
+        let dump_dst = tmp.join("backup.dump");
+        fs::copy(fixture_path("valid-pg16-custom.dump"), &dump_dst).unwrap();
+        let run_dir = tmp.join("run");
+        let run_id = unique_run_id("evreadonly");
+
+        let start = Instant::now();
+        let out = run_salavage(&manifest_path, &dump_dst, &run_dir, &run_id, &[]);
+        let elapsed = start.elapsed().as_secs();
+        assert_failed_run(
+            &out,
+            elapsed,
+            "evidence/write-failed",
+            "verification-failed",
+            300,
+            &run_id,
+            &run_dir,
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&readonly_dir, fs::Permissions::from_mode(0o755));
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}
+
+#[test]
+#[ignore]
+fn evidence_write_tmpfs_enospc_full_slice() {
+    if !require_docker() {
+        return;
+    }
+    // O4-3 true-filesystem-`ENOSPC` attempt first: tiny `tmpfs` destination,
+    // pre-filled so the evidence write fails with real `ENOSPC`. Requires
+    // Linux + mount privileges; loud-skips otherwise and `/dev/full` stays
+    // the deterministic `ENOSPC`-class representative (same `persist` path).
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipping tmpfs ENOSPC row off Linux");
+        return;
+    }
+    let _ = fs::create_dir_all("/tmp/salvage-tmpfs-probe");
+    let mount_probe = Command::new("mount")
+        .args([
+            "-t",
+            "tmpfs",
+            "-o",
+            "size=64k",
+            "tmpfs",
+            "/tmp/salvage-tmpfs-probe",
+        ])
+        .output();
+    let can_mount = match mount_probe {
+        Ok(out) if out.status.success() => {
+            let _ = Command::new("umount")
+                .arg("/tmp/salvage-tmpfs-probe")
+                .output();
+            let _ = fs::remove_dir_all("/tmp/salvage-tmpfs-probe");
+            true
+        }
+        _ => false,
+    };
+    if !can_mount {
+        eprintln!(
+            "skipping tmpfs ENOSPC row: cannot mount tmpfs (needs priv); \
+             /dev/full remains the ENOSPC-class representative, see O4-3 #49"
+        );
+        return;
+    }
+    let tag = "salvage-tiny-http:test";
+    let digest = ensure_image(&image_context("tiny-http"), tag).expect("build tiny-http");
+    for _ in 0..matrix_repeats() {
+        let tmp = unique_temp_dir("evidence-tmpfs");
+        let mnt = tmp.join("mnt");
+        fs::create_dir_all(&mnt).unwrap();
+        let mount_out = Command::new("mount")
+            .args([
+                "-t",
+                "tmpfs",
+                "-o",
+                "size=64k",
+                "tmpfs",
+                mnt.to_str().unwrap(),
+            ])
+            .output()
+            .expect("mount tmpfs");
+        if !mount_out.status.success() {
+            eprintln!("skipping tmpfs ENOSPC iteration: mount failed, cleaning up");
+            let _ = fs::remove_dir_all(&tmp);
+            continue;
+        }
+        // Pre-fill the 64 KiB tmpfs so the evidence write deterministically
+        // hits real `ENOSPC` (evidence.json alone exceeds it).
+        let filler = mnt.join("filler");
+        let fill = vec![0u8; 128 * 1024];
+        let _ = fs::write(&filler, &fill);
+        let dest = format!("file://{}/evidence", mnt.display());
+        let manifest_path = write_v3_fault(
+            &digest,
+            None,
+            None,
+            Some(sql_exec_contracts()),
+            None,
+            Some(&dest),
+            &tmp,
+        );
+        let dump_dst = tmp.join("backup.dump");
+        fs::copy(fixture_path("valid-pg16-custom.dump"), &dump_dst).unwrap();
+        let run_dir = tmp.join("run");
+        let run_id = unique_run_id("evtmpfs");
+
+        let start = Instant::now();
+        let out = run_salavage(&manifest_path, &dump_dst, &run_dir, &run_id, &[]);
+        let elapsed = start.elapsed().as_secs();
+        assert_failed_run(
+            &out,
+            elapsed,
+            "evidence/write-failed",
+            "verification-failed",
+            300,
+            &run_id,
+            &run_dir,
+        );
+        let _ = Command::new("umount").arg(&mnt).output();
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}
