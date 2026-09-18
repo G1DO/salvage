@@ -65,3 +65,31 @@ true-ENOSPC (O4-3), reachable-egress E2E (O4-4).
   fallback line is byte-identical to the old message.
 - Follow-ups stay in #45: O4-3 (true-ENOSPC, slow child), O4-4
   (SIGINT full-slice, verify-deadline, closeout).
+
+## Addendum 2026-09-18: missing-extension E2E fixture (issue #53)
+
+- Fixture `tests/fixtures/missing-extension.dump` (+sha256 in the
+  `missing_extension_full_slice` row) closes the deferred gap above with no
+  system-dir mutation inside the test and no multi-package toolchain at
+  test time.
+- Generation (one-time, build-time only): scratch `initdb` cluster,
+  `CREATE EXTENSION citext`, `salvage_records` table + 2 rows,
+  `pg_dump -Fc --no-comments`, then same-length `citext` (6) → `phantm`
+  (6) byte-patch of the 3 plaintext TOC occurrences (`EXTENSION` name,
+  `CREATE EXTENSION`, `DROP EXTENSION`). `plpgsql` cannot be the patch
+  source because pinned `plpgsql` is skipped by `pg_dump` (no entry to
+  patch); `citext` is dumped as a real extension entry. `phantm` never
+  exists on any machine, so the asymmetry (present-at-build via `citext`,
+  absent-at-restore via `phantm`) is deterministic on the single PG16
+  toolchain.
+- Restore shape (verified live, PG 16.2): exit 1,
+  `extension "phantm" is not available` +
+  `DETAIL: Could not open extension control file
+  ".../phantm.control": No such file or directory` +
+  `Command was: CREATE EXTENSION IF NOT EXISTS phantm WITH SCHEMA public;`
+  → classifier `restore/missing-extension` (same path as the existing
+  `postgis` unit shape). The matrix row mirrors `missing_role_full_slice`
+  (digest pin, `orchestration-failed`, 180 s bound, green
+  `evidence check`, cleanup success, zero leak, `phantm` on stderr).
+- No CI change: the row joins the existing `e2e_faults` job
+  (CI repeats=2 covers it).

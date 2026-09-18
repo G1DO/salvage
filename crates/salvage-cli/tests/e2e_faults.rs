@@ -1,4 +1,5 @@
 //! O4-1 fault matrix: full-slice faults with expected verdicts (parent #45).
+//! O4-2 adds missing-role / missing-extension rows (parent #45, issues #48/#53).
 //! O4-3 adds resource-exhaustion and slow-child rows (parent #45, issue #49).
 //! O4-4 adds remaining isolation/cancellation rows (parent #45, issue #50).
 //!
@@ -15,6 +16,7 @@
 //! | wrong declared DB version | `postgres.version = "99.0"` | `restore/unsupported-version` | `orchestration-failed` |
 //! | wrong app version | zeroed `app.digest` pin | `app/digest-mismatch` | `boot-failed` |
 //! | missing role | owner absent from fresh target (`missing-role.dump`) | `restore/missing-role` | `orchestration-failed` |
+//! | missing extension | extension absent from fresh target (`missing-extension.dump`) | `restore/missing-extension` | `orchestration-failed` |
 //! | malformed contract | disallowed `argv[0]` (`rm`, never spawned) | `contract/malformed` | `verification-failed` |
 //! | oversized contract | 70 KiB HTTP body vs 64 KiB cap | `contract/oversized` | `verification-failed` |
 //! | evidence-write failure | `evidence.destination = file:///dev/full` (Linux) | `evidence/write-failed` | `verification-failed` |
@@ -46,10 +48,14 @@
 //! otherwise, and the read-only row covers a second write-failure variant on
 //! the same path.
 //!
-//! Deliberately deferred beyond O4 (see #45): missing extension
-//! at E2E (classifier unit-tested with real message shapes; a deterministic
-//! fixture needs a multi-extension toolchain — the committed dumps carry no
-//! extension entries to diverge, see ADR 0008).
+//! Missing-extension E2E (issue #53, ADR 0008 addendum): `missing-extension.dump`
+//! carries a `CREATE EXTENSION phantm` entry built once via a same-length
+//! `citext` → `phantm` byte-patch of a scratch `pg_dump -Fc --no-comments`
+//! archive (pinned `plpgsql` is skipped by `pg_dump`, so no `plpgsql` entry
+//! exists to patch; `citext` is dumped as a real extension entry). `phantm`
+//! never exists on any machine, so restore deterministically fails with
+//! `could not open extension control file .../phantm.control` on the single
+//! PG16 toolchain with no system-dir mutation inside the test.
 //!
 //! Reachable-egress stays unit-double-only by design (O4-4 closeout): the
 //! per-run `--internal` isolated network cannot route outside by
@@ -512,6 +518,54 @@ fn missing_role_full_slice() {
         // The operator-actionable role name must reach the result message.
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("phantom_salvage"), "{stderr}");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}
+
+#[test]
+#[ignore]
+fn missing_extension_full_slice() {
+    if !require_docker() {
+        return;
+    }
+    // sha256 of tests/fixtures/missing-extension.dump: a `CREATE EXTENSION
+    // phantm` entry (same-length `citext` -> `phantm` byte-patch of a scratch
+    // `pg_dump -Fc --no-comments` archive), absent from the fresh target, so
+    // restore fails with `restore/missing-extension` (not
+    // `restore/corrupt-backup`). No image needed: the fault fires in restore.
+    const EXTENSION_DUMP_DIGEST: &str =
+        "sha256:26125dff9ba4c305b8838dfd94e106da84bc75fb89593332e25411d672dd0e62";
+    for _ in 0..matrix_repeats() {
+        let tmp = unique_temp_dir("missing-extension");
+        let manifest_path = write_v3_fault(
+            "sha256:e22a313ea41b0ce4bc1919997a651a41fc0ae71eaf7d605bc2cbfd03e0a32cb8",
+            Some(EXTENSION_DUMP_DIGEST),
+            None,
+            None,
+            None,
+            None,
+            &tmp,
+        );
+        let dump_dst = tmp.join("backup.dump");
+        fs::copy(fixture_path("missing-extension.dump"), &dump_dst).unwrap();
+        let run_dir = tmp.join("run");
+        let run_id = unique_run_id("extension");
+
+        let start = Instant::now();
+        let out = run_salavage(&manifest_path, &dump_dst, &run_dir, &run_id, &[]);
+        let elapsed = start.elapsed().as_secs();
+        assert_failed_run(
+            &out,
+            elapsed,
+            "restore/missing-extension",
+            "orchestration-failed",
+            180,
+            &run_id,
+            &run_dir,
+        );
+        // The operator-actionable extension name must reach the result message.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("phantm"), "{stderr}");
         let _ = fs::remove_dir_all(&tmp);
     }
 }
