@@ -68,7 +68,8 @@ SALVAGE_TEST_DOCKER=1 cargo test --test e2e_faults --locked -- --ignored
 # missing role (phantom owner) => restore/missing-role
 # missing extension (phantm, citext-patched fixture) => restore/missing-extension
 # wrong app digest => app/digest-mismatch + boot-failed
-# disallowed argv0 => contract/malformed; 70 KiB HTTP body => contract/oversized
+# disallowed argv0 => contract/malformed; allowlisted `false` => contract/crash;
+# `sleep 30` with 1 s timeout => contract/timeout (group killed); 70 KiB HTTP body => contract/oversized
 # destination file:///dev/full => evidence/write-failed (Linux, ENOSPC-class rep)
 # destination under chmod 555 dir => evidence/write-failed (EACCES variant, same path)
 # tiny tmpfs pre-filled => evidence/write-failed (true ENOSPC attempt; loud skip without mount priv, see #49)
