@@ -24,7 +24,7 @@ What it runs (`scripts/verify.sh` is canonical):
 4. `cargo audit`
 5. Negative fixture: `tests/fixtures/invalid.rs` must fail to compile
 
-Plus, when touched:
+Plus, when touched (CI always runs all of these — see `.github/workflows/ci.yml`):
 
 ```sh
 # PG16 black-box drill + evidence artifact
@@ -33,6 +33,12 @@ cargo run -p salvage-cli --locked -- run tests/fixtures/manifest-valid-pg16-rest
 # Docker boot E2E (OCI/boot touched)
 SALVAGE_TEST_DOCKER=1 cargo test --test e2e_boot --locked -- --ignored
 SALVAGE_TEST_DOCKER=1 cargo test -p salvage-oci --test boot_integration --locked -- --ignored
+
+# Docker contracts + fault matrices (contracts/isolation/fault behavior touched)
+SALVAGE_TEST_DOCKER=1 cargo test --test e2e_contracts --locked -- --ignored
+SALVAGE_TEST_DOCKER=1 SALVAGE_FAULT_MATRIX_REPEATS=2 cargo test --test e2e_faults --locked -- --ignored
+
+# v3 contracts drill (see `.github/workflows/ci.yml` for digest/http-server setup)
 ```
 
 ## Manifest authoring
