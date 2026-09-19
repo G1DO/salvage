@@ -18,6 +18,8 @@
 //! | missing role | owner absent from fresh target (`missing-role.dump`) | `restore/missing-role` | `orchestration-failed` |
 //! | missing extension | extension absent from fresh target (`missing-extension.dump`) | `restore/missing-extension` | `orchestration-failed` |
 //! | malformed contract | disallowed `argv[0]` (`rm`, never spawned) | `contract/malformed` | `verification-failed` |
+//! | crash contract | allowlisted `false` (non-zero exit) | `contract/crash` | `verification-failed` |
+//! | hang contract timeout | `sleep 30` with 1 s `timeout_ms` (group killed) | `contract/timeout` | `verification-failed` |
 //! | oversized contract | 70 KiB HTTP body vs 64 KiB cap | `contract/oversized` | `verification-failed` |
 //! | evidence-write failure | `evidence.destination = file:///dev/full` (Linux) | `evidence/write-failed` | `verification-failed` |
 //! | evidence-write read-only | `evidence.destination` under `chmod 555` dir | `evidence/write-failed` | `verification-failed` |
@@ -660,6 +662,107 @@ fn malformed_contract_argv_full_slice() {
                 .is_some_and(|o| o.contains("allowlist")),
             "rejection must name the allowlist: {}",
             contracts_out[1]
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}
+
+#[test]
+#[ignore]
+fn crash_contract_exit_full_slice() {
+    if !require_docker() {
+        return;
+    }
+    let tag = "salvage-tiny-http:test";
+    let digest = ensure_image(&image_context("tiny-http"), tag).expect("build tiny-http");
+    for _ in 0..matrix_repeats() {
+        let tmp = unique_temp_dir("crash-contract");
+        // `false` is allowlisted so it spawns, then exits non-zero: the
+        // deterministic `contract/crash` shape (vs `malformed` which never
+        // spawns, vs `oversized` which needs an HTTP body).
+        let contracts = serde_json::json!([
+            {"name": "users-count", "kind": "sql",
+             "spec": {"query": "SELECT count(*) FROM salvage_records"}, "timeout_ms": 10000},
+            {"name": "crash", "kind": "exec",
+             "spec": {"command": ["false"]}, "timeout_ms": 10000}
+        ]);
+        let manifest_path = write_v3_fault(&digest, None, None, Some(contracts), None, None, &tmp);
+        let dump_dst = tmp.join("backup.dump");
+        fs::copy(fixture_path("valid-pg16-custom.dump"), &dump_dst).unwrap();
+        let run_dir = tmp.join("run");
+        let run_id = unique_run_id("crash");
+
+        let start = Instant::now();
+        let out = run_salavage(&manifest_path, &dump_dst, &run_dir, &run_id, &[]);
+        let elapsed = start.elapsed().as_secs();
+        assert_failed_run(
+            &out,
+            elapsed,
+            "contract/crash",
+            "verification-failed",
+            300,
+            &run_id,
+            &run_dir,
+        );
+        let evidence = parse_evidence(&run_dir);
+        let contracts_out = evidence["contracts"].as_array().expect("contracts[]");
+        assert_eq!(contracts_out.len(), 2);
+        assert_eq!(contracts_out[1]["code"].as_str(), Some("contract/crash"));
+        // Default-deny holds even on contract failure: the forbidden probe
+        // ran during boot, so isolation must record the block.
+        assert_eq!(
+            evidence["isolation"]["egress"]["allowed"], false,
+            "egress must stay blocked on contract crash"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}
+
+#[test]
+#[ignore]
+fn hang_contract_timeout_full_slice() {
+    if !require_docker() {
+        return;
+    }
+    let tag = "salvage-tiny-http:test";
+    let digest = ensure_image(&image_context("tiny-http"), tag).expect("build tiny-http");
+    for _ in 0..matrix_repeats() {
+        let tmp = unique_temp_dir("hang-contract");
+        // Hung child: `sleep 30` with a 1 s contract budget. The exec
+        // supervisor kills the process group on timeout, so the run fails
+        // closed with `contract/timeout` well before the child would exit
+        // on its own (which would otherwise pass). Bound 300 keeps the
+        // O4 gate; the `contract/timeout` code itself proves the kill (a
+        // runaway sleep would report `passed`, not `timed-out`).
+        let contracts = serde_json::json!([
+            {"name": "hang", "kind": "exec",
+             "spec": {"command": ["sleep", "30"]}, "timeout_ms": 1000}
+        ]);
+        let manifest_path = write_v3_fault(&digest, None, None, Some(contracts), None, None, &tmp);
+        let dump_dst = tmp.join("backup.dump");
+        fs::copy(fixture_path("valid-pg16-custom.dump"), &dump_dst).unwrap();
+        let run_dir = tmp.join("run");
+        let run_id = unique_run_id("hangtimeout");
+
+        let start = Instant::now();
+        let out = run_salavage(&manifest_path, &dump_dst, &run_dir, &run_id, &[]);
+        let elapsed = start.elapsed().as_secs();
+        assert_failed_run(
+            &out,
+            elapsed,
+            "contract/timeout",
+            "verification-failed",
+            300,
+            &run_id,
+            &run_dir,
+        );
+        let evidence = parse_evidence(&run_dir);
+        let contracts_out = evidence["contracts"].as_array().expect("contracts[]");
+        assert_eq!(contracts_out.len(), 1);
+        assert_eq!(contracts_out[0]["code"].as_str(), Some("contract/timeout"));
+        assert_eq!(
+            evidence["isolation"]["egress"]["allowed"], false,
+            "egress must stay blocked on contract timeout"
         );
         let _ = fs::remove_dir_all(&tmp);
     }
