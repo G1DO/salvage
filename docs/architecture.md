@@ -4,12 +4,12 @@ Current implemented truth. Code is canonical; this file links it.
 
 ## Workspace boundary
 
-- `crates/salvage-cli`: executable boundary. `USAGE` in `crates/salvage-cli/src/main.rs:13`. No PostgreSQL contact in `check` / `manifest check` / `evidence check|report`.
-- `crates/salvage-core`: manifest + lifecycle/domain. Manifest spec `crates/salvage-core/src/manifest.rs:1-79`. Lifecycle spec `crates/salvage-core/src/lifecycle/mod.rs:1-52`.
-- `crates/salvage-postgres`: PostgreSQL adapter boundary. Preflight + restore `crates/salvage-postgres/src/restore.rs:20-60`.
+- `crates/salvage-cli`: executable boundary. `USAGE` in `crates/salvage-cli/src/main.rs:15`. No PostgreSQL contact in `check` / `manifest check` / `evidence check|report`.
+- `crates/salvage-core`: manifest + lifecycle/domain. Manifest spec `crates/salvage-core/src/manifest.rs`. Lifecycle spec `crates/salvage-core/src/lifecycle/mod.rs:1-52`.
+- `crates/salvage-postgres`: PostgreSQL adapter boundary. Preflight + restore `crates/salvage-postgres/src/restore.rs:20-68`.
 - `crates/salvage-evidence`: canonical evidence schema + deterministic projections. `crates/salvage-evidence/src/lib.rs:1-6`, `bundle.rs`.
 - `crates/salvage-oci`: OCI boot executor (v2/v3) with default-deny isolation (O3-3). Policy `crates/salvage-oci/src/isolation.rs`, decision `docs/decisions/0004-boot-isolation-default-deny.md`.
-- `crates/salvage-contracts`: recovery contract executor (O3-2 core, O3-4 wired to CLI/evidence). Types `crates/salvage-contracts/src/outcome.rs`, caps `crates/salvage-contracts/src/caps.rs`, runners `crates/salvage-contracts/src/executor.rs`, production backends `crates/salvage-cli/src/main.rs:261-412` (`V3Executor`).
+- `crates/salvage-contracts`: recovery contract executor (O3-2 core, O3-4 wired to CLI/evidence). Types `crates/salvage-contracts/src/outcome.rs`, caps `crates/salvage-contracts/src/caps.rs`, runners `crates/salvage-contracts/src/executor.rs`, production backends + `V3Executor` in `crates/salvage-cli/src/main.rs:417-520`.
 
 ## Run lifecycle
 
@@ -50,9 +50,9 @@ Current implemented truth. Code is canonical; this file links it.
 | `http` | minimal blocking HTTP/1.0 over `TcpStream`, no redirects; `http://` only — `https://` fails closed as `contract/crash` (no TLS deps) | same `timeout_ms` + 64 KiB body cap | `contract/timeout`, `contract/malformed` (non-`http(s)`/bad host), `contract/crash` (DNS/connect/read, incl. https), `contract/oversized`, `contract/assert-failed` (non-2xx) |
 | `exec` | real child, no shell (`Command::new(argv0)`), isolated process group, `SIGTERM → SIGKILL` + reap on timeout | same `timeout_ms` + 64 KiB cap, argv allowlist (`true,false,echo,sleep,pg_isready,psql,cat`, basename-matched, shells absent) | `contract/timeout` (group killed, pid reported), `contract/malformed` (empty/blank/not-allowlisted, no spawn), `contract/crash` (spawn fail/non-zero exit), `contract/oversized`, `contract/assert-failed` |
 
-- Declared in `v3` manifests (`contracts[]` 1..=32, unique names, `crates/salvage-core/src/manifest.rs`); executed by `ContractExecutor` (`crates/salvage-contracts/src/executor.rs`) after boot via `V3Executor::execute_contracts` (`crates/salvage-cli/src/main.rs:457-496`). Output is truncated to caps and passed through `SecretRedactor` (with env secrets) before assert/persist/display.
+- Declared in `v3` manifests (`contracts[]` 1..=32, unique names, `crates/salvage-core/src/manifest.rs`); executed by `ContractExecutor` (`crates/salvage-contracts/src/executor.rs`) after boot via `V3Executor::execute_contracts` (`crates/salvage-cli/src/main.rs:457-520`). Output is truncated to caps and passed through `SecretRedactor` (with env secrets) before assert/persist/display.
 - Isolation default-deny: per-run `salvage-net-<run-id>` `--internal` (no egress, allowlist validated but still denied); forbidden probe `prod-forbidden.invalid` (`.invalid` RFC 2606, no external net) blocked → `allowed:false`, reachable → `isolation/egress-allowed`, missing tools/spawn failure → `isolation/policy-failed` fail-closed, never `bridge`. Block recorded as `isolation{network,allowlist,egress}` in evidence; `docker ps` + `docker network ls` clean on every verdict.
-- E2E matrix (O3-5, `crates/salvage-cli/tests/e2e_contracts.rs`, `#[ignore]` + `SALVAGE_TEST_DOCKER=1`): happy-verified (PG16 dump + tiny-http + SQL + local-HTTP + exec), forbidden-egress, hang/crash, redaction canary. Fixture `tests/fixtures/manifest-valid-v3-e2e.json` (local `http://127.0.0.1:8000/` + `egress_allow ["127.0.0.1"]`). CI runs unit + opt-in Docker matrix and uploads `recovery-evidence` (v1) + `recovery-evidence-v3` (contracts + isolation). See `docs/decisions/0006-e2e-matrix-contracts-isolation.md`.
+- E2E matrix (O3-5, `crates/salvage-cli/tests/e2e_contracts.rs`, `#[ignore]` + `SALVAGE_TEST_DOCKER=1`): happy-verified (PG16 dump + tiny-http + SQL + local-HTTP + exec), forbidden-egress, hang/crash, redaction canary. Fixture `tests/fixtures/manifest-valid-v3-e2e.json` (local `http://127.0.0.1:8000/` + `egress_allow ["127.0.0.1"]`). CI runs unit + opt-in Docker matrix and uploads a single `recovery-evidence` artifact containing `target/recovery-evidence/*` (v1) + `target/recovery-evidence-v3/*` (contracts + isolation). See `docs/decisions/0006-e2e-matrix-contracts-isolation.md`.
 
 ## Fault matrix (O4, `crates/salvage-cli/tests/e2e_faults.rs`)
 

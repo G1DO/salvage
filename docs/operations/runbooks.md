@@ -19,9 +19,9 @@ Failure map: `restore/digest-mismatch` (wrong file), `restore/corrupt-backup` (u
 ## v2 boot drill
 
 ```sh
-# build (paths mirrored in tests/fixtures/images/)
-docker build -t salvage-tiny-http crates/salvage-oci/tests/fixtures/images/tiny-http
-DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' salvage-tiny-http | cut -d@ -f2)
+# canonical images live in tests/fixtures/images/ (crates/salvage-oci/tests/fixtures/images/ is a mirror)
+docker build -t salvage-tiny-http:test tests/fixtures/images/tiny-http
+DIGEST=$(docker image inspect salvage-tiny-http:test --format '{{.Id}}')
 # happy path (tcp:8080)
 cargo run -p salvage-cli --locked -- run tests/fixtures/manifest-valid-v2-boot-tcp.json \
   --backup tests/fixtures/valid-pg16-custom.dump \
