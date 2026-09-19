@@ -146,6 +146,33 @@ pub fn execute_restore(
     let poll_interval = Duration::from_millis(20);
     let start = Instant::now();
 
+    // Test-only slow-child hook: stretch restore once so stage/global
+    // deadlines fire deterministically inside restore. One-shot by design:
+    // running it inside the poll loop below would multiply the delay on
+    // every iteration and break the row's wall-clock bound.
+    if let Ok(delay_str) = std::env::var("SALVAGE_TEST_RESTORE_DELAY_MS")
+        && let Ok(delay_ms) = delay_str.parse::<u64>()
+        && delay_ms > 0
+    {
+        let sleep_chunk = Duration::from_millis(50);
+        let mut elapsed = Duration::ZERO;
+        while elapsed < Duration::from_millis(delay_ms) {
+            if cancellation_token.is_cancelled() {
+                let _ = handle.terminate(Duration::from_millis(100));
+                return Err(StageExecutionError::cancelled(
+                    cancellation_token.cancellation_signal(),
+                    "pg_restore cancelled by user signal",
+                ));
+            }
+            if deadline.is_expired() {
+                let _ = handle.terminate(Duration::from_millis(100));
+                return Err(StageExecutionError::TimedOut);
+            }
+            std::thread::sleep(sleep_chunk);
+            elapsed += sleep_chunk;
+        }
+    }
+
     loop {
         if cancellation_token.is_cancelled() {
             let _ = handle.terminate(Duration::from_millis(100));
@@ -157,28 +184,6 @@ pub fn execute_restore(
         if deadline.is_expired() {
             let _ = handle.terminate(Duration::from_millis(100));
             return Err(StageExecutionError::TimedOut);
-        }
-
-        if let Ok(delay_str) = std::env::var("SALVAGE_TEST_RESTORE_DELAY_MS")
-            && let Ok(delay_ms) = delay_str.parse::<u64>()
-        {
-            let sleep_chunk = Duration::from_millis(50);
-            let mut elapsed = Duration::ZERO;
-            while elapsed < Duration::from_millis(delay_ms) {
-                if cancellation_token.is_cancelled() {
-                    let _ = handle.terminate(Duration::from_millis(100));
-                    return Err(StageExecutionError::cancelled(
-                        cancellation_token.cancellation_signal(),
-                        "pg_restore cancelled by user signal",
-                    ));
-                }
-                if deadline.is_expired() {
-                    let _ = handle.terminate(Duration::from_millis(100));
-                    return Err(StageExecutionError::TimedOut);
-                }
-                std::thread::sleep(sleep_chunk);
-                elapsed += sleep_chunk;
-            }
         }
 
         match handle.try_wait() {
